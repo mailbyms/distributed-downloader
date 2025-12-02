@@ -76,11 +76,18 @@ pub struct TaskResult {
     #[prost(string, tag = "3")]
     pub error_message: ::prost::alloc::string::String,
 }
+/// 初始命令消息
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InitialCommand {
+    #[prost(enumeration = "CommandType", tag = "1")]
+    pub command_type: i32,
+}
 /// 通用消息包装器
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Message {
-    #[prost(oneof = "message::Payload", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "message::Payload", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub payload: ::core::option::Option<message::Payload>,
 }
 /// Nested message and enum types in `Message`.
@@ -88,26 +95,62 @@ pub mod message {
     #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
-        /// Manager to Server messages
+        /// Initial command
         #[prost(message, tag = "1")]
-        ServerRegister(super::ServerRegister),
+        InitialCommand(super::InitialCommand),
+        /// Manager to Server messages
         #[prost(message, tag = "2")]
+        ServerRegister(super::ServerRegister),
+        #[prost(message, tag = "3")]
         DownloadTask(super::DownloadTask),
         /// Server to Manager messages
-        #[prost(message, tag = "3")]
-        ServerInfo(super::ServerInfo),
         #[prost(message, tag = "4")]
-        ServerDown(super::ServerDown),
+        ServerInfo(super::ServerInfo),
         #[prost(message, tag = "5")]
+        ServerDown(super::ServerDown),
+        #[prost(message, tag = "6")]
         TaskResult(super::TaskResult),
         /// Client to Manager messages
-        #[prost(message, tag = "6")]
+        #[prost(message, tag = "7")]
         DownloadRequest(super::DownloadRequest),
         /// Manager to Client messages
-        #[prost(message, tag = "7")]
+        #[prost(message, tag = "8")]
         FileInfoResponse(super::FileInfoResponse),
         /// Data transfer
-        #[prost(bytes, tag = "8")]
+        #[prost(bytes, tag = "9")]
         FileData(::prost::alloc::vec::Vec<u8>),
+    }
+}
+/// 初始命令类型
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CommandType {
+    Unknown = 0,
+    ServerRegister = 1,
+    ServerDown = 2,
+    DownloadRequest = 3,
+}
+impl CommandType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            CommandType::Unknown => "UNKNOWN",
+            CommandType::ServerRegister => "SERVER_REGISTER",
+            CommandType::ServerDown => "SERVER_DOWN",
+            CommandType::DownloadRequest => "DOWNLOAD_REQUEST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "UNKNOWN" => Some(Self::Unknown),
+            "SERVER_REGISTER" => Some(Self::ServerRegister),
+            "SERVER_DOWN" => Some(Self::ServerDown),
+            "DOWNLOAD_REQUEST" => Some(Self::DownloadRequest),
+            _ => None,
+        }
     }
 }

@@ -52,25 +52,41 @@ message TaskResult {
   string error_message = 3;
 }
 
+// 初始命令类型
+enum CommandType {
+  UNKNOWN = 0;
+  SERVER_REGISTER = 1;
+  SERVER_DOWN = 2;
+  DOWNLOAD_REQUEST = 3;
+}
+
+// 初始命令消息
+message InitialCommand {
+  CommandType command_type = 1;
+}
+
 // 通用消息包装器
 message Message {
   oneof payload {
+    // Initial command
+    InitialCommand initial_command = 1;
+
     // Manager to Server messages
-    ServerRegister server_register = 1;
-    DownloadTask download_task = 2;
+    ServerRegister server_register = 2;
+    DownloadTask download_task = 3;
 
     // Server to Manager messages
-    ServerInfo server_info = 3;
-    ServerDown server_down = 4;
-    TaskResult task_result = 5;
+    ServerInfo server_info = 4;
+    ServerDown server_down = 5;
+    TaskResult task_result = 6;
 
     // Client to Manager messages
-    DownloadRequest download_request = 6;
+    DownloadRequest download_request = 7;
 
     // Manager to Client messages
-    FileInfoResponse file_info_response = 7;
+    FileInfoResponse file_info_response = 8;
 
     // Data transfer
-    bytes file_data = 8;
+    bytes file_data = 9;
   }
 }

@@ -74,7 +74,7 @@ impl HttpDownloader {
         right_point: u64,
         file_path: &str,
     ) -> Result<()> {
-        println!("Multi-threaded downloading is not supported by {}. Downloading will be single-threaded.", url);
+        println!("Downloading {}, [{} -> {}] ", url, left_point, right_point);
         self.partial_request(url, left_point, right_point, file_path).await
     }
 

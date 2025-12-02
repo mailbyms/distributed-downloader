@@ -98,39 +98,58 @@ impl ServerNetwork {
 
     /// Register with manager
     async fn register_with_manager(&self, socket: &mut TcpStream) -> Result<()> {
-        // Send registration message
-        socket.write_all(b"server_register").await?;
+        // Send registration command as protobuf message
+        let initial_command = InitialCommand {
+            command_type: CommandType::ServerRegister as i32,
+        };
+        let initial_message = crate::proto::distributed_downloader::Message {
+            payload: Some(message::Payload::InitialCommand(initial_command)),
+        };
+        let initial_encoded = initial_message.encode_to_vec();
+        socket.write_all(&initial_encoded).await?;
 
         // Wait for acknowledgment
         let mut buffer = [0; 2048];
         let n = socket.read(&mut buffer).await?;
-        let response = String::from_utf8_lossy(&buffer[..n]);
 
-        if response == "go_ahead" {
-            // Send server info as protobuf message
-            let server_register = ServerRegister {
-                server_id: self.id as u32,
-            };
-            let message = crate::proto::distributed_downloader::Message {
-                payload: Some(message::Payload::ServerRegister(server_register)),
-            };
-            let encoded = message.encode_to_vec();
-            socket.write_all(&encoded).await?;
+        // Try to decode as a protobuf message
+        if let Ok(ack_message) = ProstMessage::decode(&buffer[..n]) {
+            let ack_message: crate::proto::distributed_downloader::Message = ack_message;
+            // Check if this is a file data message with "go_ahead" content
+            if let Some(message::Payload::FileData(data)) = ack_message.payload {
+                if String::from_utf8_lossy(&data) == "go_ahead" {
+                    // Send server info
+                    let server_register = ServerRegister {
+                        server_id: self.id as u32,
+                    };
+                    let message = crate::proto::distributed_downloader::Message {
+                        payload: Some(message::Payload::ServerRegister(server_register)),
+                    };
+                    let encoded = message.encode_to_vec();
+                    socket.write_all(&encoded).await?;
 
-            // Wait for final acknowledgment
-            let mut buffer = [0; 2048];
-            let n = socket.read(&mut buffer).await?;
-            let response = String::from_utf8_lossy(&buffer[..n]);
+                    // Wait for final acknowledgment
+                    let mut buffer = [0; 2048];
+                    let n = socket.read(&mut buffer).await?;
 
-            if response == "registered" {
-                println!("Successfully registered with manager");
-                Ok(())
-            } else {
-                Err(crate::error::DistributedDownloaderError::NetworkError("Registration failed".to_string()))
+                    // Try to decode as a protobuf message
+                    if let Ok(final_ack_message) = ProstMessage::decode(&buffer[..n]) {
+                        let final_ack_message: crate::proto::distributed_downloader::Message = final_ack_message;
+                        // Check if this is a file data message with "registered" content
+                        if let Some(message::Payload::FileData(data)) = final_ack_message.payload {
+                            if String::from_utf8_lossy(&data) == "registered" {
+                                println!("Successfully registered with manager");
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    return Err(crate::error::DistributedDownloaderError::NetworkError("Registration failed".to_string()));
+                }
             }
-        } else {
-            Err(crate::error::DistributedDownloaderError::NetworkError("Registration not acknowledged".to_string()))
         }
+
+        Err(crate::error::DistributedDownloaderError::NetworkError("Registration not acknowledged".to_string()))
     }
 
     /// Listen for tasks from manager
