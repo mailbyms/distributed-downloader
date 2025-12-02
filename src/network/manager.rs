@@ -30,6 +30,12 @@ pub struct TaskInfo {
     pub completed: bool, // Track if this task is completed
 }
 
+/// Track server status to ensure each server handles only one task at a time
+#[derive(Debug, Clone)]
+pub struct ServerStatus {
+    pub current_task: Option<String>, // Track the current task ID assigned to this server
+}
+
 /// Manager network handler
 pub struct ManagerNetwork {
     server_list: Arc<Mutex<Vec<ServerInfo>>>,
@@ -39,6 +45,8 @@ pub struct ManagerNetwork {
     server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
     // Map of task_id to task info for tracking download intervals
     task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
+    // Map of server info to server status for tracking current tasks
+    server_status: Arc<TokioMutex<HashMap<ServerInfo, ServerStatus>>>,
 }
 
 impl ManagerNetwork {
@@ -49,6 +57,7 @@ impl ManagerNetwork {
             pending_tasks: Arc::new(TokioMutex::new(HashMap::new())),
             server_connections: Arc::new(TokioMutex::new(HashMap::new())),
             task_infos: Arc::new(TokioMutex::new(HashMap::new())),
+            server_status: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -65,9 +74,10 @@ impl ManagerNetwork {
             let pending_tasks = self.pending_tasks.clone();
             let server_connections = self.server_connections.clone();
             let task_infos = self.task_infos.clone();
+            let server_status = self.server_status.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(socket, server_list, pending_tasks, server_connections, task_infos).await {
+                if let Err(e) = Self::handle_connection(socket, server_list, pending_tasks, server_connections, task_infos, server_status).await {
                     eprintln!("Error handling connection: {}", e);
                 }
             });
@@ -81,6 +91,7 @@ impl ManagerNetwork {
         pending_tasks: Arc<TokioMutex<HashMap<String, TcpStream>>>,
         server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
         task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
+        server_status: Arc<TokioMutex<HashMap<ServerInfo, ServerStatus>>>,
     ) -> Result<()> {
         // Read initial message to determine connection type
         let mut buffer = [0; 2048];
@@ -128,6 +139,12 @@ impl ManagerNetwork {
 
                             println!("Server list: {:?}", server_list.lock().unwrap());
 
+                            // Initialize server status
+                            {
+                                let mut status = server_status.lock().await;
+                                status.insert(server_info.clone(), ServerStatus { current_task: None });
+                            }
+
                             // Maintain persistent connection by spawning a task to handle messages from this server
                             let server_info_clone = server_info.clone();
                             let server_connections_clone = server_connections.clone();
@@ -172,6 +189,13 @@ impl ManagerNetwork {
                                 let mut connections = server_connections.lock().await;
                                 connections.remove(&server_info);
                                 println!("Removed connection for server: {}", server_info.id);
+                            }
+
+                            // Also remove the server status
+                            {
+                                let mut status = server_status.lock().await;
+                                status.remove(&server_info);
+                                println!("Removed status for server: {}", server_info.id);
                             }
 
                             println!("Server list: {:?}", server_list.lock().unwrap());
@@ -219,6 +243,7 @@ impl ManagerNetwork {
                                                 task_infos,
                                                 socket,
                                                 server_connections,
+                                                server_status,
                                                 file_info,
                                             ).await?;
                                         }
@@ -240,19 +265,30 @@ impl ManagerNetwork {
                         println!("Received task result for task: {}", task_result.task_id);
 
                         // Mark the task as completed
-                        let mut infos = task_infos.lock().await;
-                        if let Some(task_info) = infos.get_mut(&task_result.task_id) {
-                            task_info.completed = true;
-                            println!("Marked task {} as completed", task_result.task_id);
-                        } else {
-                            eprintln!("Task info not found for task: {}", task_result.task_id);
+                        let assigned_server = {
+                            let mut infos = task_infos.lock().await;
+                            if let Some(task_info) = infos.get_mut(&task_result.task_id) {
+                                task_info.completed = true;
+                                println!("Marked task {} as completed", task_result.task_id);
+                                task_info.assigned_server.clone()
+                            } else {
+                                eprintln!("Task info not found for task: {}", task_result.task_id);
+                                None
+                            }
+                        };
+
+                        // Clear the server status to indicate it's no longer handling this task
+                        if let Some(server) = assigned_server {
+                            let mut status = server_status.lock().await;
+                            if let Some(server_status) = status.get_mut(&server) {
+                                server_status.current_task = None;
+                            }
                         }
-                        drop(infos); // Release the lock
 
                         // Assign new pending tasks to available servers
                         // We need to get the final_url - for now we'll use a placeholder
                         // In a real implementation, we would store the URL with the task or retrieve it from somewhere
-                        Self::assign_pending_tasks(server_list.clone(), task_infos.clone(), server_connections.clone(), "".to_string()).await?;
+                        Self::assign_pending_tasks(server_list.clone(), task_infos.clone(), server_connections.clone(), server_status.clone(), "".to_string()).await?;
 
                         // Forward the data to the waiting client
                         // First, get the task info to get the download interval
@@ -420,6 +456,7 @@ impl ManagerNetwork {
         task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
         client_socket: TcpStream,
         server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
+        server_status: Arc<TokioMutex<HashMap<ServerInfo, ServerStatus>>>,
         file_info: FileInfoResponse,
     ) -> Result<()> {
         let servers = {
@@ -464,7 +501,7 @@ impl ManagerNetwork {
         tasks.insert(client_id.clone(), client_socket);
 
         // Assign initial tasks to available servers
-        Self::assign_pending_tasks(server_list, task_infos.clone(), server_connections.clone(), file_info.final_url.clone()).await?;
+        Self::assign_pending_tasks(server_list, task_infos.clone(), server_connections.clone(), server_status.clone(), file_info.final_url.clone()).await?;
 
         Ok(())
     }
@@ -474,6 +511,7 @@ impl ManagerNetwork {
         server_list: Arc<Mutex<Vec<ServerInfo>>>,
         task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
         server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
+        server_status: Arc<TokioMutex<HashMap<ServerInfo, ServerStatus>>>,
         final_url: String,
     ) -> Result<()> {
         let servers = {
@@ -485,7 +523,7 @@ impl ManagerNetwork {
             return Ok(());
         }
 
-        // Find unassigned tasks and assign them to servers
+        // Find unassigned tasks
         let task_ids_to_assign: Vec<String> = {
             let infos = task_infos.lock().await;
             infos.iter()
@@ -494,15 +532,46 @@ impl ManagerNetwork {
                 .collect()
         };
 
-        let mut server_index = 0;
+        // For each task, find an available server (one that is not currently handling a task)
         for task_id in task_ids_to_assign {
-            let server = &servers[server_index % servers.len()];
+            // Find available servers (servers with no current task)
+            let available_servers: Vec<ServerInfo> = {
+                let status = server_status.lock().await;
+                servers.iter()
+                    .filter(|server| {
+                        if let Some(server_status) = status.get(server) {
+                            server_status.current_task.is_none()
+                        } else {
+                            // If server status is not found, consider it available
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect()
+            };
+
+            if available_servers.is_empty() {
+                // No available servers, skip this task for now
+                println!("No available servers for task {}, will retry later", task_id);
+                continue;
+            }
+
+            // Select the first available server
+            let server = &available_servers[0];
 
             // Update task info
             {
                 let mut infos = task_infos.lock().await;
                 if let Some(task_info) = infos.get_mut(&task_id) {
                     task_info.assigned_server = Some(server.clone());
+                }
+            }
+
+            // Update server status to indicate it's now handling this task
+            {
+                let mut status = server_status.lock().await;
+                if let Some(server_status) = status.get_mut(server) {
+                    server_status.current_task = Some(task_id.clone());
                 }
             }
 
@@ -529,12 +598,15 @@ impl ManagerNetwork {
                     if let Some(task_info) = infos.get_mut(&task_id) {
                         task_info.assigned_server = None;
                     }
+                    // Also clear the server status
+                    let mut status = server_status.lock().await;
+                    if let Some(server_status) = status.get_mut(server) {
+                        server_status.current_task = None;
+                    }
                 } else {
                     println!("Sent download task {} to server:{} with interval [{}, {}]",
                              task_id, server.id, task_info.start_position, task_info.end_position);
                 }
-
-                server_index += 1;
             }
         }
 
