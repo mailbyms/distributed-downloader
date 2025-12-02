@@ -1,10 +1,11 @@
 //! Client network communication
 
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use crate::error::{DistributedDownloaderError, Result};
 use crate::network::manager::{ServerInfo, DownloadRequest, FileInfoResponse};
 use tokio::fs::File;
+use std::collections::HashMap;
 
 /// Client network handler
 pub struct ClientNetwork;
@@ -65,7 +66,7 @@ impl ClientNetwork {
                 println!("Received file info: size={}, chunks={}", file_info.file_size, file_info.chunk_count);
 
                 // Pre-allocate disk space for the file
-                let mut file = File::create(file_path).await?;
+                let file = File::create(file_path).await?;
                 file.set_len(file_info.file_size).await?;
 
                 // Send acknowledgment to manager
@@ -78,6 +79,21 @@ impl ClientNetwork {
                     chunk_positions[i] = pos;
                     pos += size;
                 }
+
+                // Create a temporary file to store the downloaded data
+                let temp_file_path = format!("{}.tmp", file_path);
+                let temp_file = File::create(&temp_file_path).await?;
+
+                // Create a map to track the expected data ranges
+                let mut expected_ranges: HashMap<String, (u64, u64)> = HashMap::new();
+
+                // Reopen the file for random access writing
+                drop(temp_file); // Close the temporary file
+                let mut file = File::create(file_path).await?;
+                file.set_len(file_info.file_size).await?; // Pre-allocate disk space
+
+                // Track the current task context for data writing
+                let mut current_task_id: Option<String> = None;
 
                 // Receive file segments from manager
                 loop {
@@ -92,17 +108,48 @@ impl ClientNetwork {
                     let message = String::from_utf8_lossy(data);
 
                     if message.starts_with("task_data:") {
-                        // This is a task data marker, the actual data follows
-                        // In a real implementation, we would parse the task ID and handle accordingly
-                        // For now, we'll just continue reading the data
+                        // This is a task data marker with format "task_data:{task_id}:{start}-{end}"
+                        // Parse the start and end positions
+                        let parts: Vec<&str> = message.split(':').collect();
+                        if parts.len() == 3 {
+                            let range_parts: Vec<&str> = parts[2].split('-').collect();
+                            if range_parts.len() == 2 {
+                                if let (Ok(start_pos), Ok(end_pos)) = (range_parts[0].parse::<u64>(), range_parts[1].parse::<u64>()) {
+                                    println!("Received task data for range {}-{}", start_pos, end_pos);
+
+                                    // Store the range info for this task
+                                    let task_id = parts[1].to_string();
+                                    expected_ranges.insert(task_id.clone(), (start_pos, end_pos));
+                                    current_task_id = Some(task_id);
+                                    continue; // Continue to read the actual data
+                                }
+                            }
+                        }
+                        // If we can't parse the range info, just continue reading
+                        current_task_id = None;
                         continue;
                     } else {
                         // This is file data, write it to the file at the correct position
-                        // For simplicity, we're just appending in this example
-                        // In a real implementation, you would track which chunk this is and write to the correct position
-                        file.write_all(data).await?;
+                        if let Some(ref task_id) = current_task_id {
+                            if let Some(&(start_pos, _end_pos)) = expected_ranges.get(task_id) {
+                                // Seek to the correct position and write the data
+                                file.seek(tokio::io::SeekFrom::Start(start_pos)).await?;
+                                file.write_all(data).await?;
+
+                                // Update the range info to reflect that we've written this data
+                                // This is a simplified approach - in a real implementation you might track progress more precisely
+                                println!("Wrote {} bytes at position {} for task {}", data.len(), start_pos, task_id);
+                            }
+                        } else {
+                            // If we don't have task context, just append (fallback behavior)
+                            file.write_all(data).await?;
+                        }
                     }
                 }
+
+                // Clean up the temporary file if it still exists
+                let temp_file_path = format!("{}.tmp", file_path);
+                let _ = tokio::fs::remove_file(&temp_file_path).await;
             }
         }
 

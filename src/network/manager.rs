@@ -37,6 +37,12 @@ pub struct DownloadTask {
     pub task_id: String,  // Unique identifier for this task
 }
 
+/// Information about a download task for tracking purposes
+#[derive(Debug, Clone)]
+pub struct TaskInfo {
+    pub download_interval: [u64; 2],
+}
+
 /// Manager network handler
 pub struct ManagerNetwork {
     server_list: Arc<Mutex<Vec<ServerInfo>>>,
@@ -44,6 +50,8 @@ pub struct ManagerNetwork {
     pending_tasks: Arc<TokioMutex<HashMap<String, TcpStream>>>,
     // Map of server info to server connection for pushing tasks
     server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
+    // Map of task_id to task info for tracking download intervals
+    task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
 }
 
 impl ManagerNetwork {
@@ -53,6 +61,7 @@ impl ManagerNetwork {
             server_list: Arc::new(Mutex::new(Vec::new())),
             pending_tasks: Arc::new(TokioMutex::new(HashMap::new())),
             server_connections: Arc::new(TokioMutex::new(HashMap::new())),
+            task_infos: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -68,9 +77,10 @@ impl ManagerNetwork {
             let server_list = self.server_list.clone();
             let pending_tasks = self.pending_tasks.clone();
             let server_connections = self.server_connections.clone();
+            let task_infos = self.task_infos.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(socket, server_list, pending_tasks, server_connections).await {
+                if let Err(e) = Self::handle_connection(socket, server_list, pending_tasks, server_connections, task_infos).await {
                     eprintln!("Error handling connection: {}", e);
                 }
             });
@@ -83,6 +93,7 @@ impl ManagerNetwork {
         server_list: Arc<Mutex<Vec<ServerInfo>>>,
         pending_tasks: Arc<TokioMutex<HashMap<String, TcpStream>>>,
         server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
+        task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
     ) -> Result<()> {
         // Read initial message to determine connection type
         let mut buffer = [0; 2048];
@@ -193,6 +204,7 @@ impl ManagerNetwork {
                             download_request,
                             server_list,
                             pending_tasks,
+                            task_infos,
                             socket,
                             server_connections,
                             file_info,
@@ -212,29 +224,40 @@ impl ManagerNetwork {
                         println!("Received completed task data for task: {}", task_id);
 
                         // Forward the data to the waiting client
-                        let mut tasks = pending_tasks.lock().await;
-                        if let Some(mut client_socket) = tasks.remove(&task_id) {
-                            // Send the task ID first
-                            client_socket.write_all(format!("task_data:{}", task_id).as_bytes()).await?;
+                        // First, get the task info to get the download interval
+                        let task_info = {
+                            let mut infos = task_infos.lock().await;
+                            infos.remove(&task_id) // Remove and get the task info
+                        };
 
-                            // Then forward the rest of the data
-                            let remaining_data = &buffer[n..];
-                            if !remaining_data.is_empty() {
-                                client_socket.write_all(remaining_data).await?;
-                            }
+                        if let Some(task_info) = task_info {
+                            let mut tasks = pending_tasks.lock().await;
+                            if let Some(mut client_socket) = tasks.remove(&task_id) {
+                                // Send the task ID and download interval
+                                let interval_msg = format!("task_data:{}:{}-{}", task_id, task_info.download_interval[0], task_info.download_interval[1]);
+                                client_socket.write_all(interval_msg.as_bytes()).await?;
 
-                            // Continue reading and forwarding data
-                            loop {
-                                let n = match socket.read(&mut buffer).await {
-                                    Ok(0) => break, // Connection closed
-                                    Ok(n) => n,
-                                    Err(_) => break, // Error occurred
-                                };
+                                // Then forward the rest of the data
+                                let remaining_data = &buffer[n..];
+                                if !remaining_data.is_empty() {
+                                    client_socket.write_all(remaining_data).await?;
+                                }
 
-                                if let Err(_) = client_socket.write_all(&buffer[..n]).await {
-                                    break; // Client disconnected
+                                // Continue reading and forwarding data
+                                loop {
+                                    let n = match socket.read(&mut buffer).await {
+                                        Ok(0) => break, // Connection closed
+                                        Ok(n) => n,
+                                        Err(_) => break, // Error occurred
+                                    };
+
+                                    if let Err(_) = client_socket.write_all(&buffer[..n]).await {
+                                        break; // Client disconnected
+                                    }
                                 }
                             }
+                        } else {
+                            eprintln!("Task info not found for task: {}", task_id);
                         }
                     }
                 } else {
@@ -325,7 +348,7 @@ impl ManagerNetwork {
             .await?;
 
         // 打印出响应头以供调试
-        println!("HEAD response headers: {:#?}", head_response.headers());
+        // println!("HEAD response headers: {:#?}", head_response.headers());
 
         // If HEAD request fails, try to get file size from GET request
         let file_size = if head_response.status().is_success() {
@@ -365,9 +388,10 @@ impl ManagerNetwork {
 
     /// Distribute download task to servers
     async fn distribute_download_task(
-        download_request: DownloadRequest,
+        _download_request: DownloadRequest,
         server_list: Arc<Mutex<Vec<ServerInfo>>>,
         pending_tasks: Arc<TokioMutex<HashMap<String, TcpStream>>>,
+        task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
         client_socket: TcpStream,
         server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
         file_info: FileInfoResponse,
@@ -392,72 +416,53 @@ impl ManagerNetwork {
         }
 
         // Send each interval to a different server
-        // For the first server, we store the client socket
-        let _first_task_id = if let Some(first_server) = servers.first() {
-            let task_id = uuid::Uuid::new_v4().to_string();
+        // For all servers, we need to store the client socket so we can forward data back to the client
+        // We'll create a collection to hold all the task IDs that should forward to the same client
+        let mut task_ids_to_client = Vec::new();
 
-            // Get the download interval for the first server
-            let first_interval = if !intervals.is_empty() {
-                intervals[0]
-            } else {
-                let file_size = file_info.file_size;
-                let end = file_size.saturating_sub(1);
-                [0, end]
-            };
-
-            // Store the client socket for the first task
-            let mut tasks = pending_tasks.lock().await;
-            tasks.insert(task_id.clone(), client_socket);
-
-            // Create download task for the first server
-            let download_task = DownloadTask {
-                url: file_info.final_url.clone(),
-                download_interval: first_interval,
-                task_id: task_id.clone(),
-            };
-
-            // Send task to first server through long-lived connection
-            if let Err(e) = Self::send_task_to_server_through_connection(first_server, download_task, server_connections.clone()).await {
-                eprintln!("Failed to send task to server: {}", e);
-
-                // Remove the pending task if we failed to send it
-                let mut tasks = pending_tasks.lock().await;
-                tasks.remove(&task_id);
-            } else {
-                println!("Sent download task {} to server {} with interval [{}, {}]",
-                         task_id, first_server.id, first_interval[0], first_interval[1]);
-            }
-
-            Some(task_id)
-        } else {
-            None
-        };
-
-        // For remaining servers, send tasks without storing client socket
-        for (i, server) in servers.iter().enumerate().skip(1) {
+        for (i, server) in servers.iter().enumerate() {
             if i >= intervals.len() {
                 break; // No more intervals to send
             }
 
             let task_id = uuid::Uuid::new_v4().to_string();
+            task_ids_to_client.push(task_id.clone());
 
             // Get the download interval for this server
             let interval = intervals[i];
 
             // Create download task
             let download_task = DownloadTask {
-                url: download_request.url.clone(),
+                url: file_info.final_url.clone(),
                 download_interval: interval,
                 task_id: task_id.clone(),
             };
 
+            // Store task info for tracking download intervals
+            let task_info = TaskInfo {
+                download_interval: interval,
+            };
+            let mut infos = task_infos.lock().await;
+            infos.insert(task_id.clone(), task_info);
+
             // Send task to server through long-lived connection
             if let Err(e) = Self::send_task_to_server_through_connection(server, download_task, server_connections.clone()).await {
                 eprintln!("Failed to send task to server: {}", e);
+                // Remove the task info if we failed to send the task
+                let mut infos = task_infos.lock().await;
+                infos.remove(&task_id);
             } else {
                 println!("Sent download task {} to server:{} with interval [{}, {}]",
                          task_id, server.id, interval[0], interval[1]);
             }
+        }
+
+        // Store the client socket for all tasks (this is a simplified approach)
+        // In a real implementation, we would need a more sophisticated way to handle this
+        if !task_ids_to_client.is_empty() {
+            let first_task_id = &task_ids_to_client[0];
+            let mut tasks = pending_tasks.lock().await;
+            tasks.insert(first_task_id.clone(), client_socket);
         }
 
         Ok(())
