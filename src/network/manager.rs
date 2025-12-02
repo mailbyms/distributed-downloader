@@ -302,9 +302,10 @@ impl ManagerNetwork {
 
     /// Get file information from URL
     async fn get_file_info(url: &str) -> Result<FileInfoResponse> {
-        // Create a client that follows redirects
+        // Create a client that follows redirects with a browser-like User-Agent
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10)) // Allow up to 10 redirects
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
             .build()?;
 
         // First, resolve any redirects by sending a GET request (but not downloading the body)
@@ -315,6 +316,7 @@ impl ManagerNetwork {
 
         // Get the final URL after redirects
         let final_url = resolved_url_response.url().clone();
+        print!("Final URL after redirects: {}\n", final_url);
 
         // Now send a HEAD request to the final URL to get file size
         let head_response = client
@@ -322,10 +324,22 @@ impl ManagerNetwork {
             .send()
             .await?;
 
-        let file_size = head_response.headers().get("content-length")
-            .and_then(|val| val.to_str().ok())
-            .and_then(|val| val.parse::<u64>().ok())
-            .unwrap_or(1000000); // Default to 1MB if we can't get the file size
+        // 打印出响应头以供调试
+        println!("HEAD response headers: {:#?}", head_response.headers());
+
+        // If HEAD request fails, try to get file size from GET request
+        let file_size = if head_response.status().is_success() {
+            head_response.headers().get("Content-Length")
+                .and_then(|val| val.to_str().ok())
+                .and_then(|val| val.parse::<u64>().ok())
+                .unwrap_or(1000000) // Default to 1MB if we can't get the file size
+        } else {
+            // As a fallback, try to get file size from the GET response we already made
+            resolved_url_response.headers().get("Content-Length")
+                .and_then(|val| val.to_str().ok())
+                .and_then(|val| val.parse::<u64>().ok())
+                .unwrap_or(1000000) // Default to 1MB if we can't get the file size
+        };
 
         println!("File size: {} bytes", file_size);
 
