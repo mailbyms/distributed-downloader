@@ -1,0 +1,6 @@
+# Server configuration example
+manager_addr_ipv4: 127.0.0.1
+manager_port: 5000
+tmp_dir: ./ddr-download/server/tmp/
+threads_num: 4
+target_dir: ./ddr-download/server/target/
