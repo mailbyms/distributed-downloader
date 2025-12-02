@@ -64,3 +64,9 @@ impl From<tokio::task::JoinError> for DistributedDownloaderError {
         DistributedDownloaderError::NetworkError(format!("Task join error: {}", error))
     }
 }
+
+impl From<prost::DecodeError> for DistributedDownloaderError {
+    fn from(error: prost::DecodeError) -> Self {
+        DistributedDownloaderError::ParseError(format!("Protobuf decode error: {}", error))
+    }
+}

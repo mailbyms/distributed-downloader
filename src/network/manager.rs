@@ -3,44 +3,31 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::{Arc, Mutex};
-use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use std::collections::HashMap;
 use tokio::sync::Mutex as TokioMutex;
+use crate::proto::distributed_downloader::*;
+use prost::Message as ProstMessage;
 
 /// Information about a server
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, Hash, PartialEq)]
-pub struct ServerInfo {
-    pub id: u16
-}
+pub type ServerInfo = crate::proto::distributed_downloader::ServerInfo;
 
 /// Download request from client
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadRequest {
-    pub url: String,
-}
+pub type DownloadRequest = crate::proto::distributed_downloader::DownloadRequest;
 
 /// File information response to client
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileInfoResponse {
-    pub file_size: u64,
-    pub chunk_count: usize,
-    pub chunk_sizes: Vec<u64>,
-    pub final_url: String,
-}
+pub type FileInfoResponse = crate::proto::distributed_downloader::FileInfoResponse;
 
 /// Task to be sent to server
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadTask {
-    pub url: String,
-    pub download_interval: [u64; 2],
-    pub task_id: String,  // Unique identifier for this task
-}
+pub type DownloadTask = crate::proto::distributed_downloader::DownloadTask;
 
 /// Information about a download task for tracking purposes
 #[derive(Debug, Clone)]
 pub struct TaskInfo {
-    pub download_interval: [u64; 2],
+    pub start_position: u64,
+    pub end_position: u64,
+    pub assigned_server: Option<ServerInfo>, // Track which server is assigned to this task
+    pub completed: bool, // Track if this task is completed
 }
 
 /// Manager network handler
@@ -106,73 +93,87 @@ impl ManagerNetwork {
 
                 let mut buffer = [0; 2048];
                 let n = socket.read(&mut buffer).await?;
-                let server_info_str = String::from_utf8_lossy(&buffer[..n]);
-                let server_info: ServerInfo = serde_json::from_str(&server_info_str)?;
+                let message: Message = ProstMessage::decode(&buffer[..n])?;
 
-                // Store server info and connection
-                {
-                    let mut list: std::sync::MutexGuard<'_, Vec<ServerInfo>> = server_list.lock().unwrap();
-                    // Check if server already exists to avoid duplicates
-                    if !list.contains(&server_info) {
-                        list.push(server_info.clone());
-                        println!("Added server: {}", server_info.id);
-                    } else {
-                        println!("Server already registered: {}", server_info.id);
-                    }
-                }
+                if let Some(message::Payload::ServerRegister(server_register)) = message.payload {
+                    let server_info = ServerInfo { id: server_register.server_id };
 
-                // Send final acknowledgment
-                socket.write_all(b"registered").await?;
-
-                println!("Server list: {:?}", server_list.lock().unwrap());
-
-                // Maintain persistent connection by spawning a task to handle messages from this server
-                let server_info_clone = server_info.clone();
-                let server_connections_clone = server_connections.clone();
-
-                tokio::spawn(async move {
-                    // Store the connection for future use
+                    // Store server info and connection
                     {
-                        let mut connections = server_connections_clone.lock().await;
-                        connections.insert(server_info_clone.clone(), socket);
+                        let mut list: std::sync::MutexGuard<'_, Vec<ServerInfo>> = server_list.lock().unwrap();
+                        // Check if server already exists to avoid duplicates
+                        if !list.iter().any(|s| s.id == server_info.id) {
+                            list.push(server_info.clone());
+                            println!("Added server: {}", server_info.id);
+                        } else {
+                            println!("Server already registered: {}", server_info.id);
+                        }
                     }
 
-                    // Connection is now maintained for future communication
-                    println!("Maintaining persistent connection with server {}", server_info_clone.id);
+                    // Send final acknowledgment
+                    socket.write_all(b"registered").await?;
 
-                    // In a more advanced implementation, we could periodically check the connection health
-                    // and remove stale connections. For now, we'll rely on the server to notify us when it goes down.
-                });
+                    println!("Server list: {:?}", server_list.lock().unwrap());
+
+                    // Maintain persistent connection by spawning a task to handle messages from this server
+                    let server_info_clone = server_info.clone();
+                    let server_connections_clone = server_connections.clone();
+
+                    tokio::spawn(async move {
+                        // Store the connection for future use
+                        {
+                            let mut connections = server_connections_clone.lock().await;
+                            connections.insert(server_info_clone.clone(), socket);
+                        }
+
+                        // Connection is now maintained for future communication
+                        println!("Maintaining persistent connection with server {}", server_info_clone.id);
+
+                        // In a more advanced implementation, we could periodically check the connection health
+                        // and remove stale connections. For now, we'll rely on the server to notify us when it goes down.
+                    });
+                }
             },
             "server_down" => {
                 socket.write_all(b"go_ahead").await?;
 
                 let mut buffer = [0; 2048];
                 let n = socket.read(&mut buffer).await?;
-                let server_info_str = String::from_utf8_lossy(&buffer[..n]);
-                let server_info: ServerInfo = serde_json::from_str(&server_info_str)?;
+                let message: Message = ProstMessage::decode(&buffer[..n])?;
 
-                {
-                    let mut list = server_list.lock().unwrap();
-                    list.retain(|s| !(s.id == server_info.id));
-                    println!("Removed server: {}", server_info.id);
+                if let Some(message::Payload::ServerDown(server_down)) = message.payload {
+                    let server_info = ServerInfo { id: server_down.server_id };
+
+                    {
+                        let mut list = server_list.lock().unwrap();
+                        list.retain(|s| s.id != server_info.id);
+                        println!("Removed server: {}", server_info.id);
+                    }
+
+                    // Also remove the connection from the server_connections map
+                    {
+                        let mut connections = server_connections.lock().await;
+                        connections.remove(&server_info);
+                        println!("Removed connection for server: {}", server_info.id);
+                    }
+
+                    println!("Server list: {:?}", server_list.lock().unwrap());
                 }
-
-                // Also remove the connection from the server_connections map
-                {
-                    let mut connections = server_connections.lock().await;
-                    connections.remove(&server_info);
-                    println!("Removed connection for server: {}", server_info.id);
-                }
-
-                println!("Server list: {:?}", server_list.lock().unwrap());
             },
             "ask_for_server_list" => {
-                let server_list_json = {
+                let list = {
                     let list = server_list.lock().unwrap();
-                    serde_json::to_string(&*list)?
+                    list.clone()
                 };
-                socket.write_all(server_list_json.as_bytes()).await?;
+
+                // Create a Message containing all server info
+                for server_info in list {
+                    let message = crate::proto::distributed_downloader::Message {
+                        payload: Some(message::Payload::ServerInfo(server_info)),
+                    };
+                    let encoded = message.encode_to_vec();
+                    socket.write_all(&encoded).await?;
+                }
                 println!("Sent server list to client");
             },
             "download_request" => {
@@ -181,83 +182,116 @@ impl ManagerNetwork {
 
                 let mut buffer = [0; 4096];
                 let n = socket.read(&mut buffer).await?;
-                let request_str = String::from_utf8_lossy(&buffer[..n]);
-                let download_request: DownloadRequest = serde_json::from_str(&request_str)?;
+                let message: Message = ProstMessage::decode(&buffer[..n])?;
 
-                println!("Received download request for URL: {}", download_request.url);
+                if let Some(message::Payload::DownloadRequest(download_request)) = message.payload {
+                    println!("Received download request for URL: {}", download_request.url);
 
-                // Get file information and send it to client
-                if let Ok(file_info) = Self::get_file_info(&download_request.url).await {
-                    // Send file info to client
-                    let file_info_str = serde_json::to_string(&file_info)?;
-                    let response = format!("file_info:{}", file_info_str);
-                    socket.write_all(response.as_bytes()).await?;
+                    // Get file information and send it to client
+                    if let Ok(file_info) = Self::get_file_info(&download_request.url).await {
+                        // Send file info to client
+                        let file_info_msg = Message {
+                            payload: Some(message::Payload::FileInfoResponse(file_info.clone())),
+                        };
+                        let encoded = file_info_msg.encode_to_vec();
+                        socket.write_all(&encoded).await?;
 
-                    // Wait for client acknowledgment
-                    let mut ack_buffer = [0; 2048];
-                    let ack_n = socket.read(&mut ack_buffer).await?;
-                    let ack_message = String::from_utf8_lossy(&ack_buffer[..ack_n]);
+                        // Wait for client acknowledgment
+                        let mut ack_buffer = [0; 2048];
+                        let ack_n = socket.read(&mut ack_buffer).await?;
+                        let ack_message = String::from_utf8_lossy(&ack_buffer[..ack_n]);
 
-                    if ack_message == "ready_for_download" {
-                        // Distribute the download task to available servers
-                        Self::distribute_download_task(
-                            download_request,
-                            server_list,
-                            pending_tasks,
-                            task_infos,
-                            socket,
-                            server_connections,
-                            file_info,
-                        ).await?;
+                        if ack_message == "ready_for_download" {
+                            // Distribute the download task to available servers
+                            Self::distribute_download_task(
+                                download_request,
+                                server_list,
+                                pending_tasks,
+                                task_infos,
+                                socket,
+                                server_connections,
+                                file_info,
+                            ).await?;
+                        }
+                    } else {
+                        eprintln!("Failed to get file information for URL: {}", download_request.url);
                     }
-                } else {
-                    eprintln!("Failed to get file information for URL: {}", download_request.url);
                 }
             },
             _ => {
-                // Check if this is a server response with file data
-                if message.starts_with("task_complete:") {
-                    // This is a server sending completed task data
-                    let parts: Vec<&str> = message.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        let task_id = parts[1].to_string();
-                        println!("Received completed task data for task: {}", task_id);
+                // Try to decode as a protobuf message
+                if let Ok(message) = ProstMessage::decode(buffer[..n].as_ref()) {
+                    let message: crate::proto::distributed_downloader::Message = message;
+                    match message.payload {
+                        Some(message::Payload::TaskResult(task_result)) => {
+                            println!("Received task result for task: {}", task_result.task_id);
 
-                        // Forward the data to the waiting client
-                        // First, get the task info to get the download interval
-                        let task_info = {
+                            // Mark the task as completed
                             let mut infos = task_infos.lock().await;
-                            infos.remove(&task_id) // Remove and get the task info
-                        };
+                            if let Some(task_info) = infos.get_mut(&task_result.task_id) {
+                                task_info.completed = true;
+                                println!("Marked task {} as completed", task_result.task_id);
+                            } else {
+                                eprintln!("Task info not found for task: {}", task_result.task_id);
+                            }
+                            drop(infos); // Release the lock
 
-                        if let Some(task_info) = task_info {
-                            let mut tasks = pending_tasks.lock().await;
-                            if let Some(mut client_socket) = tasks.remove(&task_id) {
-                                // Send the task ID and download interval
-                                let interval_msg = format!("task_data:{}:{}-{}", task_id, task_info.download_interval[0], task_info.download_interval[1]);
-                                client_socket.write_all(interval_msg.as_bytes()).await?;
+                            // Assign new pending tasks to available servers
+                            // We need to get the final_url - for now we'll use a placeholder
+                            // In a real implementation, we would store the URL with the task or retrieve it from somewhere
+                            Self::assign_pending_tasks(server_list.clone(), task_infos.clone(), server_connections.clone(), "".to_string()).await?;
 
-                                // Then forward the rest of the data
-                                let remaining_data = &buffer[n..];
-                                if !remaining_data.is_empty() {
-                                    client_socket.write_all(remaining_data).await?;
-                                }
+                            // Forward the data to the waiting client
+                            // First, get the task info to get the download interval
+                            let task_info = {
+                                let infos = task_infos.lock().await;
+                                infos.get(&task_result.task_id).cloned() // Get the task info without removing it
+                            };
 
-                                // Continue reading and forwarding data
-                                loop {
-                                    let n = match socket.read(&mut buffer).await {
-                                        Ok(0) => break, // Connection closed
-                                        Ok(n) => n,
-                                        Err(_) => break, // Error occurred
-                                    };
+                            if let Some(task_info) = task_info {
+                                let mut tasks = pending_tasks.lock().await;
+                                // Use the client_id we stored earlier instead of task_id
+                                // For now, we'll use a placeholder - in a real implementation we'd track this properly
+                                if let Some(client_socket) = tasks.values_mut().next() {
+                                    // Send the task ID and download interval
+                                    let interval_msg = format!("task_data:{}:{}-{}", task_result.task_id, task_info.start_position, task_info.end_position);
+                                    client_socket.write_all(interval_msg.as_bytes()).await?;
 
-                                    if let Err(_) = client_socket.write_all(&buffer[..n]).await {
-                                        break; // Client disconnected
+                                    // Then forward the rest of the data
+                                    let remaining_data = &buffer[n..];
+                                    if !remaining_data.is_empty() {
+                                        client_socket.write_all(remaining_data).await?;
+                                    }
+
+                                    // Continue reading and forwarding data
+                                    loop {
+                                        let n = match socket.read(&mut buffer).await {
+                                            Ok(0) => break, // Connection closed
+                                            Ok(n) => n,
+                                            Err(_) => break, // Error occurred
+                                        };
+
+                                        if let Err(_) = client_socket.write_all(&buffer[..n]).await {
+                                            break; // Client disconnected
+                                        }
                                     }
                                 }
+                            } else {
+                                eprintln!("Task info not found for task: {}", task_result.task_id);
                             }
-                        } else {
-                            eprintln!("Task info not found for task: {}", task_id);
+                        }
+                        Some(message::Payload::FileData(file_data)) => {
+                            // Handle file data
+                            println!("Received file data: {} bytes", file_data.len());
+
+                            // Forward the data to the waiting client
+                            let mut tasks = pending_tasks.lock().await;
+                            if let Some(client_socket) = tasks.values_mut().next() {
+                                client_socket.write_all(&file_data).await?;
+                            }
+                        }
+                        _ => {
+                            eprintln!("Unknown protobuf message payload");
                         }
                     }
                 } else {
@@ -278,48 +312,27 @@ impl ManagerNetwork {
         // Get the connection for this server
         let mut connections = server_connections.lock().await;
         if let Some(socket) = connections.get_mut(server_info) {
-            // Send task command
-            if let Err(e) = socket.write_all(b"download_task").await {
-                eprintln!("Failed to send task command to server {}: {}", server_info.id, e);
+            // Create protobuf message for the task
+            let message = crate::proto::distributed_downloader::Message {
+                payload: Some(message::Payload::DownloadTask(task)),
+            };
+            let encoded = message.encode_to_vec();
+
+            // Send the task details directly (no need for separate command and ack)
+            if let Err(e) = socket.write_all(&encoded).await {
+                eprintln!("Failed to send task details to server {}: {}", server_info.id, e);
                 // Remove the broken connection
                 connections.remove(server_info);
                 // Fall back to creating a new connection
-                return Self::send_task_to_server(server_info, task).await;
+                return Self::send_task_to_server(server_info, message).await;
             }
-
-            // Wait for acknowledgment
-            let mut buffer = [0; 2048];
-            let n = match socket.read(&mut buffer).await {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Failed to read acknowledgment from server {}: {}", server_info.id, e);
-                    // Remove the broken connection
-                    connections.remove(server_info);
-                    // Fall back to creating a new connection
-                    return Self::send_task_to_server(server_info, task).await;
-                }
-            };
-
-            let response = String::from_utf8_lossy(&buffer[..n]);
-
-            if response == "go_ahead" {
-                // Send the task details
-                let task_str = serde_json::to_string(&task)?;
-                if let Err(e) = socket.write_all(task_str.as_bytes()).await {
-                    eprintln!("Failed to send task details to server {}: {}", server_info.id, e);
-                    // Remove the broken connection
-                    connections.remove(server_info);
-                    // Fall back to creating a new connection
-                    return Self::send_task_to_server(server_info, task).await;
-                }
-                Ok(())
-            } else {
-                eprintln!("Server {} did not acknowledge task: {}", server_info.id, response);
-                Err(crate::error::DistributedDownloaderError::NetworkError("Server did not acknowledge task".to_string()))
-            }
+            Ok(())
         } else {
             // If we don't have a connection, fall back to creating a new one
-            Self::send_task_to_server(server_info, task).await
+            let message = crate::proto::distributed_downloader::Message {
+                payload: Some(message::Payload::DownloadTask(task)),
+            };
+            Self::send_task_to_server(server_info, message).await
         }
     }
 
@@ -366,21 +379,22 @@ impl ManagerNetwork {
 
         println!("File size: {} bytes", file_size);
 
-        // For simplicity, we'll assume a fixed chunk count for now
-        // In a real implementation, this would be based on available servers
-        let chunk_count = 4;
-        let chunk_size = file_size / chunk_count as u64;
+        // Calculate chunk sizes with maximum 10MB per chunk
+        const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024; // 10MB in bytes
+        let chunk_count = ((file_size + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE) as usize; // Ceiling division
+        let chunk_size = MAX_CHUNK_SIZE;
         let mut chunk_sizes = vec![chunk_size; chunk_count];
 
-        // Adjust the last chunk size to account for any remainder
-        if file_size % chunk_count as u64 != 0 {
-            let remainder = file_size % chunk_count as u64;
-            *chunk_sizes.last_mut().unwrap() += remainder;
+        // Adjust the last chunk size to match the actual file size
+        if chunk_count > 0 {
+            let last_chunk_index = chunk_count - 1;
+            let actual_last_chunk_size = file_size - (last_chunk_index as u64 * chunk_size);
+            chunk_sizes[last_chunk_index] = actual_last_chunk_size;
         }
 
         Ok(FileInfoResponse {
             file_size,
-            chunk_count,
+            chunk_count: chunk_count as u32,
             chunk_sizes,
             final_url: final_url.to_string(),
         })
@@ -411,80 +425,117 @@ impl ManagerNetwork {
         let mut start = 0u64;
         for &chunk_size in &file_info.chunk_sizes {
             let end = start + chunk_size - 1;
-            intervals.push([start, end]);
+            intervals.push((start, end));
             start = end + 1;
         }
 
-        // Send each interval to a different server
-        // For all servers, we need to store the client socket so we can forward data back to the client
-        // We'll create a collection to hold all the task IDs that should forward to the same client
-        let mut task_ids_to_client = Vec::new();
+        // Create task info for all chunks but don't assign them yet
+        // We'll assign tasks dynamically as servers become available
+        for (i, (start_pos, end_pos)) in intervals.iter().enumerate() {
+            let task_id = format!("task_{}", i);
 
-        for (i, server) in servers.iter().enumerate() {
-            if i >= intervals.len() {
-                break; // No more intervals to send
-            }
-
-            let task_id = uuid::Uuid::new_v4().to_string();
-            task_ids_to_client.push(task_id.clone());
-
-            // Get the download interval for this server
-            let interval = intervals[i];
-
-            // Create download task
-            let download_task = DownloadTask {
-                url: file_info.final_url.clone(),
-                download_interval: interval,
-                task_id: task_id.clone(),
-            };
-
-            // Store task info for tracking download intervals
+            // Create task info
             let task_info = TaskInfo {
-                download_interval: interval,
+                start_position: *start_pos,
+                end_position: *end_pos,
+                assigned_server: None, // Not assigned yet
+                completed: false,
             };
-            let mut infos = task_infos.lock().await;
-            infos.insert(task_id.clone(), task_info);
 
-            // Send task to server through long-lived connection
-            if let Err(e) = Self::send_task_to_server_through_connection(server, download_task, server_connections.clone()).await {
-                eprintln!("Failed to send task to server: {}", e);
-                // Remove the task info if we failed to send the task
-                let mut infos = task_infos.lock().await;
-                infos.remove(&task_id);
-            } else {
-                println!("Sent download task {} to server:{} with interval [{}, {}]",
-                         task_id, server.id, interval[0], interval[1]);
-            }
+            let mut infos = task_infos.lock().await;
+            infos.insert(task_id, task_info);
         }
 
-        // Store the client socket for all tasks (this is a simplified approach)
-        // In a real implementation, we would need a more sophisticated way to handle this
-        if !task_ids_to_client.is_empty() {
-            let first_task_id = &task_ids_to_client[0];
-            let mut tasks = pending_tasks.lock().await;
-            tasks.insert(first_task_id.clone(), client_socket);
+        // Store the client socket
+        let client_id = uuid::Uuid::new_v4().to_string();
+        let mut tasks = pending_tasks.lock().await;
+        tasks.insert(client_id.clone(), client_socket);
+
+        // Assign initial tasks to available servers
+        Self::assign_pending_tasks(server_list, task_infos.clone(), server_connections.clone(), file_info.final_url.clone()).await?;
+
+        Ok(())
+    }
+
+    /// Assign pending tasks to available servers
+    async fn assign_pending_tasks(
+        server_list: Arc<Mutex<Vec<ServerInfo>>>,
+        task_infos: Arc<TokioMutex<HashMap<String, TaskInfo>>>,
+        server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
+        final_url: String,
+    ) -> Result<()> {
+        let servers = {
+            let list = server_list.lock().unwrap();
+            list.clone()
+        };
+
+        if servers.is_empty() {
+            return Ok(());
+        }
+
+        // Find unassigned tasks and assign them to servers
+        let task_ids_to_assign: Vec<String> = {
+            let infos = task_infos.lock().await;
+            infos.iter()
+                .filter(|(_, task_info)| task_info.assigned_server.is_none() && !task_info.completed)
+                .map(|(task_id, _)| task_id.clone())
+                .collect()
+        };
+
+        let mut server_index = 0;
+        for task_id in task_ids_to_assign {
+            let server = &servers[server_index % servers.len()];
+
+            // Update task info
+            {
+                let mut infos = task_infos.lock().await;
+                if let Some(task_info) = infos.get_mut(&task_id) {
+                    task_info.assigned_server = Some(server.clone());
+                }
+            }
+
+            // Get task info for creating download task
+            let task_info = {
+                let infos = task_infos.lock().await;
+                infos.get(&task_id).cloned()
+            };
+
+            if let Some(task_info) = task_info {
+                // Create download task
+                let download_task = DownloadTask {
+                    url: final_url.clone(),
+                    start_position: task_info.start_position,
+                    end_position: task_info.end_position,
+                    task_id: task_id.clone(),
+                };
+
+                // Send task to server through long-lived connection
+                if let Err(e) = Self::send_task_to_server_through_connection(server, download_task, server_connections.clone()).await {
+                    eprintln!("Failed to send task to server: {}", e);
+                    // Mark task as unassigned so it can be reassigned
+                    let mut infos = task_infos.lock().await;
+                    if let Some(task_info) = infos.get_mut(&task_id) {
+                        task_info.assigned_server = None;
+                    }
+                } else {
+                    println!("Sent download task {} to server:{} with interval [{}, {}]",
+                             task_id, server.id, task_info.start_position, task_info.end_position);
+                }
+
+                server_index += 1;
+            }
         }
 
         Ok(())
     }
 
     /// Send a download task to a server
-    async fn send_task_to_server(server_info: &ServerInfo, task: DownloadTask) -> Result<()> {
-        let mut socket = TcpStream::connect(format!("{}", server_info.id)).await?;
+    async fn send_task_to_server(server_info: &ServerInfo, message: Message) -> Result<()> {
+        let mut socket = TcpStream::connect(format!("{}:{}", "127.0.0.1", server_info.id)).await?;
 
-        // Send task command
-        socket.write_all(b"download_task").await?;
-
-        // Wait for acknowledgment
-        let mut buffer = [0; 2048];
-        let n = socket.read(&mut buffer).await?;
-        let response = String::from_utf8_lossy(&buffer[..n]);
-
-        if response == "go_ahead" {
-            // Send the task details
-            let task_str = serde_json::to_string(&task)?;
-            socket.write_all(task_str.as_bytes()).await?;
-        }
+        // Send the task details directly as protobuf message
+        let encoded = message.encode_to_vec();
+        socket.write_all(&encoded).await?;
 
         Ok(())
     }

@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package distributed_downloader;
+
+// Server注册消息
+message ServerRegister {
+  uint32 server_id = 1;
+}
+
+// Server下线消息
+message ServerDown {
+  uint32 server_id = 1;
+}
+
+// Server信息
+message ServerInfo {
+  uint32 id = 1;
+}
+
+// 下载请求
+message DownloadRequest {
+  string url = 1;
+}
+
+// 文件信息响应
+message FileInfoResponse {
+  uint64 file_size = 1;
+  uint32 chunk_count = 2;
+  repeated uint64 chunk_sizes = 3;
+  string final_url = 4;
+}
+
+// 下载元数据
+message DownloadMetadata {
+  string url = 1;
+  uint64 start_position = 2;
+  uint64 end_position = 3;
+}
+
+// 下载任务
+message DownloadTask {
+  string url = 1;
+  uint64 start_position = 2;
+  uint64 end_position = 3;
+  string task_id = 4;
+}
+
+// 任务结果
+message TaskResult {
+  string task_id = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+// 通用消息包装器
+message Message {
+  oneof payload {
+    // Manager to Server messages
+    ServerRegister server_register = 1;
+    DownloadTask download_task = 2;
+
+    // Server to Manager messages
+    ServerInfo server_info = 3;
+    ServerDown server_down = 4;
+    TaskResult task_result = 5;
+
+    // Client to Manager messages
+    DownloadRequest download_request = 6;
+
+    // Manager to Client messages
+    FileInfoResponse file_info_response = 7;
+
+    // Data transfer
+    bytes file_data = 8;
+  }
+}

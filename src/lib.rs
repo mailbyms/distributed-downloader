@@ -18,6 +18,9 @@ pub mod utils;
 /// Error types and handling
 pub mod error;
 
+/// Protobuf generated messages
+pub mod proto;
+
 // Re-export commonly used types
 pub use config::{ClientConfig, ServerConfig, ManagerConfig};
 pub use downloader::HttpDownloader;

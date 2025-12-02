@@ -2,7 +2,6 @@
 
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::downloader::HttpDownloader;
 // sleep is not currently used, but kept for potential future use
@@ -11,29 +10,17 @@ use crate::downloader::HttpDownloader;
 // use tokio::time::Duration;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use crate::proto::distributed_downloader::*;
+use prost::Message as ProstMessage;
 
 /// Metadata for file download
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadMetadata {
-    pub url: String,
-    pub download_interval: [u64; 2],
-}
+pub type DownloadMetadata = crate::proto::distributed_downloader::DownloadMetadata;
 
 /// Task to be sent to server
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadTask {
-    pub url: String,
-    pub download_interval: [u64; 2],
-    pub task_id: String,  // Unique identifier for this task
-}
+pub type DownloadTask = crate::proto::distributed_downloader::DownloadTask;
 
 /// Task result to be sent back to manager
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskResult {
-    pub task_id: String,
-    pub success: bool,
-    pub error_message: Option<String>,
-}
+pub type TaskResult = crate::proto::distributed_downloader::TaskResult;
 
 /// Server network handler
 pub struct ServerNetwork {
@@ -120,12 +107,15 @@ impl ServerNetwork {
         let response = String::from_utf8_lossy(&buffer[..n]);
 
         if response == "go_ahead" {
-            // Send server info
-            let server_info = serde_json::json!({
-                "id": self.id,
-            });
-            let server_info_str = serde_json::to_string(&server_info)?;
-            socket.write_all(server_info_str.as_bytes()).await?;
+            // Send server info as protobuf message
+            let server_register = ServerRegister {
+                server_id: self.id as u32,
+            };
+            let message = crate::proto::distributed_downloader::Message {
+                payload: Some(message::Payload::ServerRegister(server_register)),
+            };
+            let encoded = message.encode_to_vec();
+            socket.write_all(&encoded).await?;
 
             // Wait for final acknowledgment
             let mut buffer = [0; 2048];
@@ -156,38 +146,34 @@ impl ServerNetwork {
                 break;
             }
 
-            let message = String::from_utf8_lossy(&buffer[..n]);
-            println!("Received message from manager: {}", message);
+            // Try to decode as a protobuf message
+            if let Ok(message) = Message::decode(&buffer[..n]) {
+                match message.payload {
+                    Some(message::Payload::DownloadTask(download_task)) => {
+                        println!("Received download task: {:?}", download_task);
 
-            // Check if this is a download task
-            if message == "download_task" {
-                // Acknowledge receipt
-                socket.write_all(b"go_ahead").await?;
-
-                // Receive task details
-                let mut buffer = [0; 8192];
-                let n = socket.read(&mut buffer).await?;
-                let task_str = String::from_utf8_lossy(&buffer[..n]);
-                let task: DownloadTask = serde_json::from_str(&task_str)?;
-
-                println!("Received download task: {:?}", task);
-
-                // Process the download task in a separate task
-                let server_clone = self.clone();
-                let manager_addr = self.manager_addr.clone();
-                let manager_port = self.manager_port;
-                tokio::spawn(async move {
-                    // Create a new connection to send the response
-                    // We need a new connection because the main connection is still listening for tasks
-                    if let Ok(response_socket) = TcpStream::connect(format!("{}:{}", manager_addr, manager_port)).await {
-                        if let Err(e) = server_clone.process_download_task(response_socket, task).await {
-                            eprintln!("Error processing download task: {}", e);
-                        }
-                    } else {
-                        eprintln!("Failed to connect to manager for sending response");
+                        // Process the download task in a separate task
+                        let server_clone = self.clone();
+                        let manager_addr = self.manager_addr.clone();
+                        let manager_port = self.manager_port;
+                        tokio::spawn(async move {
+                            // Create a new connection to send the response
+                            // We need a new connection because the main connection is still listening for tasks
+                            if let Ok(response_socket) = TcpStream::connect(format!("{}:{}", manager_addr, manager_port)).await {
+                                if let Err(e) = server_clone.process_download_task(response_socket, download_task).await {
+                                    eprintln!("Error processing download task: {}", e);
+                                }
+                            } else {
+                                eprintln!("Failed to connect to manager for sending response");
+                            }
+                        });
                     }
-                });
+                    _ => {
+                        eprintln!("Unknown protobuf message from manager");
+                    }
+                }
             } else {
+                let message = String::from_utf8_lossy(&buffer[..n]);
                 eprintln!("Unknown message from manager: {}", message);
             }
         }
@@ -206,8 +192,8 @@ impl ServerNetwork {
         let result = self.http_downloader
             .download_segment(
                 &task.url,
-                task.download_interval[0],
-                task.download_interval[1],
+                task.start_position,
+                task.end_position,
                 &self.tmp_dir,
                 &file_path,
                 self.thread_number,
@@ -215,10 +201,20 @@ impl ServerNetwork {
             .await;
 
         // Send task completion message
-        let _task_result = if result.is_ok() {
-            // Send file segment back to manager
-            socket.write_all(format!("task_complete:{}", task.task_id).as_bytes()).await?;
+        if result.is_ok() {
+            // Send task result back to manager
+            let task_result = TaskResult {
+                task_id: task.task_id.clone(),
+                success: true,
+                error_message: String::new(),
+            };
+            let message = crate::proto::distributed_downloader::Message {
+                payload: Some(message::Payload::TaskResult(task_result)),
+            };
+            let encoded = message.encode_to_vec();
+            socket.write_all(&encoded).await?;
 
+            // Send file segment back to manager
             let mut file = tokio::fs::File::open(&file_path).await?;
             let mut buffer = [0; 2048];
 
@@ -227,27 +223,33 @@ impl ServerNetwork {
                 if n == 0 {
                     break;
                 }
-                socket.write_all(&buffer[..n]).await?;
+
+                // Send file data as protobuf message
+                let file_data_message = Message {
+                    payload: Some(message::Payload::FileData(buffer[..n].to_vec())),
+                };
+                let encoded = file_data_message.encode_to_vec();
+                socket.write_all(&encoded).await?;
             }
 
             // Clean up downloaded file
             tokio::fs::remove_file(&file_path).await?;
-
-            TaskResult {
-                task_id: task.task_id.clone(),
-                success: true,
-                error_message: None,
-            }
         } else {
             let error_msg = format!("Download failed: {}", result.err().unwrap());
             eprintln!("{}", error_msg);
 
-            TaskResult {
+            // Send task result back to manager
+            let task_result = TaskResult {
                 task_id: task.task_id.clone(),
                 success: false,
-                error_message: Some(error_msg),
-            }
-        };
+                error_message: error_msg,
+            };
+            let message = crate::proto::distributed_downloader::Message {
+                payload: Some(message::Payload::TaskResult(task_result)),
+            };
+            let encoded = message.encode_to_vec();
+            socket.write_all(&encoded).await?;
+        }
 
         println!("Completed download task: {}", task.task_id);
         Ok(())
