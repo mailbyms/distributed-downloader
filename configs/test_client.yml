@@ -1,0 +1,5 @@
+# Test client configuration
+manager_addr_ipv4: 127.0.0.1
+manager_port: 5000
+tmp_dir: ./ddr-download/test-client/tmp/
+target_dir: ./ddr-download/test-client/target/

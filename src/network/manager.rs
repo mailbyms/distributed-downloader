@@ -20,6 +20,15 @@ pub struct DownloadRequest {
     pub url: String,
 }
 
+/// File information response to client
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileInfoResponse {
+    pub file_size: u64,
+    pub chunk_count: usize,
+    pub chunk_sizes: Vec<u64>,
+    pub final_url: String,
+}
+
 /// Task to be sent to server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadTask {
@@ -166,14 +175,32 @@ impl ManagerNetwork {
 
                 println!("Received download request for URL: {}", download_request.url);
 
-                // Distribute the download task to available servers
-                Self::distribute_download_task(
-                    download_request,
-                    server_list,
-                    pending_tasks,
-                    socket,
-                    server_connections
-                ).await?;
+                // Get file information and send it to client
+                if let Ok(file_info) = Self::get_file_info(&download_request.url).await {
+                    // Send file info to client
+                    let file_info_str = serde_json::to_string(&file_info)?;
+                    let response = format!("file_info:{}", file_info_str);
+                    socket.write_all(response.as_bytes()).await?;
+
+                    // Wait for client acknowledgment
+                    let mut ack_buffer = [0; 2048];
+                    let ack_n = socket.read(&mut ack_buffer).await?;
+                    let ack_message = String::from_utf8_lossy(&ack_buffer[..ack_n]);
+
+                    if ack_message == "ready_for_download" {
+                        // Distribute the download task to available servers
+                        Self::distribute_download_task(
+                            download_request,
+                            server_list,
+                            pending_tasks,
+                            socket,
+                            server_connections,
+                            file_info,
+                        ).await?;
+                    }
+                } else {
+                    eprintln!("Failed to get file information for URL: {}", download_request.url);
+                }
             },
             _ => {
                 // Check if this is a server response with file data
@@ -273,6 +300,55 @@ impl ManagerNetwork {
         }
     }
 
+    /// Get file information from URL
+    async fn get_file_info(url: &str) -> Result<FileInfoResponse> {
+        // Create a client that follows redirects
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10)) // Allow up to 10 redirects
+            .build()?;
+
+        // First, resolve any redirects by sending a GET request (but not downloading the body)
+        let resolved_url_response = client
+            .get(url)
+            .send()
+            .await?;
+
+        // Get the final URL after redirects
+        let final_url = resolved_url_response.url().clone();
+
+        // Now send a HEAD request to the final URL to get file size
+        let head_response = client
+            .head(final_url.as_str())
+            .send()
+            .await?;
+
+        let file_size = head_response.headers().get("content-length")
+            .and_then(|val| val.to_str().ok())
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(1000000); // Default to 1MB if we can't get the file size
+
+        println!("File size: {} bytes", file_size);
+
+        // For simplicity, we'll assume a fixed chunk count for now
+        // In a real implementation, this would be based on available servers
+        let chunk_count = 4;
+        let chunk_size = file_size / chunk_count as u64;
+        let mut chunk_sizes = vec![chunk_size; chunk_count];
+
+        // Adjust the last chunk size to account for any remainder
+        if file_size % chunk_count as u64 != 0 {
+            let remainder = file_size % chunk_count as u64;
+            *chunk_sizes.last_mut().unwrap() += remainder;
+        }
+
+        Ok(FileInfoResponse {
+            file_size,
+            chunk_count,
+            chunk_sizes,
+            final_url: final_url.to_string(),
+        })
+    }
+
     /// Distribute download task to servers
     async fn distribute_download_task(
         download_request: DownloadRequest,
@@ -280,6 +356,7 @@ impl ManagerNetwork {
         pending_tasks: Arc<TokioMutex<HashMap<String, TcpStream>>>,
         client_socket: TcpStream,
         server_connections: Arc<TokioMutex<HashMap<ServerInfo, TcpStream>>>,
+        file_info: FileInfoResponse,
     ) -> Result<()> {
         let servers = {
             let list = server_list.lock().unwrap();
@@ -291,22 +368,14 @@ impl ManagerNetwork {
             return Ok(());
         }
 
-        // Send HEAD request to get file size
-        let client = reqwest::Client::new();
-        let response = client.head(&download_request.url).send().await?;
-        let file_size = response.headers().get("content-length")
-            .and_then(|val| val.to_str().ok())
-            .and_then(|val| val.parse::<u64>().ok())
-            .unwrap_or(1000000); // Default to 1MB if we can't get the file size
-
-        println!("File size: {} bytes", file_size);
-
-        // Split the file range among servers
-        let intervals = crate::utils::distributor::DownloadDistributor::download_interval_list(
-            0,
-            file_size.saturating_sub(1), // End position is inclusive
-            servers.len(),
-        );
+        // Split the file range based on chunk sizes
+        let mut intervals = Vec::new();
+        let mut start = 0u64;
+        for &chunk_size in &file_info.chunk_sizes {
+            let end = start + chunk_size - 1;
+            intervals.push([start, end]);
+            start = end + 1;
+        }
 
         // Send each interval to a different server
         // For the first server, we store the client socket
@@ -317,7 +386,7 @@ impl ManagerNetwork {
             let first_interval = if !intervals.is_empty() {
                 intervals[0]
             } else {
-                let file_size = 1000000u64; // Default to 1MB
+                let file_size = file_info.file_size;
                 let end = file_size.saturating_sub(1);
                 [0, end]
             };
@@ -328,7 +397,7 @@ impl ManagerNetwork {
 
             // Create download task for the first server
             let download_task = DownloadTask {
-                url: download_request.url.clone(),
+                url: file_info.final_url.clone(),
                 download_interval: first_interval,
                 task_id: task_id.clone(),
             };
@@ -352,22 +421,14 @@ impl ManagerNetwork {
 
         // For remaining servers, send tasks without storing client socket
         for (i, server) in servers.iter().enumerate().skip(1) {
+            if i >= intervals.len() {
+                break; // No more intervals to send
+            }
+
             let task_id = uuid::Uuid::new_v4().to_string();
 
             // Get the download interval for this server
-            let interval = if i < intervals.len() {
-                intervals[i]
-            } else {
-                // Fallback if we have more servers than intervals
-                let file_size = 1000000u64; // Default to 1MB
-                let start = (file_size / servers.len() as u64) * i as u64;
-                let end = if i == servers.len() - 1 {
-                    file_size.saturating_sub(1)
-                } else {
-                    ((file_size / servers.len() as u64) * (i + 1) as u64).saturating_sub(1)
-                };
-                [start, end]
-            };
+            let interval = intervals[i];
 
             // Create download task
             let download_task = DownloadTask {
