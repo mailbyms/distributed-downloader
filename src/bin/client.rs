@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::fs::{File, OpenOptions};
+use std::fs::{OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use tonic::Request;
 use tracing::{info, warn};
