@@ -1,45 +1,39 @@
-//! Client binary for the Distributed Downloader.
+
+//! Client logic for the Distributed Downloader.
 
 use anyhow::Result;
-use clap::Parser;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::fs::{OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use tonic::Request;
 use tracing::{info, warn};
 
-use distributed_downloader::{
-    // config::ClientConfig, // Removed
-    proto::distributed_downloader::{
-        client_data_chunk, manager_service_client::ManagerServiceClient, DownloadRequest,
-    },
+use crate::proto::distributed_downloader::{
+    client_data_chunk, manager_service_client::ManagerServiceClient, DownloadRequest,
 };
 
 /// Command-line arguments for the client.
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// The URL of the file to download.
     #[clap()]
-    url: String,
+    pub url: String,
 
     /// The output file name.
     #[clap(short, long)]
-    output: String,
+    pub output: String,
 
     /// Address of the manager (e.g., "http://127.0.0.1:5000").
     #[clap(short, long, default_value = "http://127.0.0.1:5000")]
-    manager_address: String,
+    pub manager_address: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
+/// Runs the client.
+pub async fn run(args: &Args) -> Result<()> {
+    // Note: Tracing is initialized in the main binary.
     info!("Connecting to manager at {}...", args.manager_address);
-    let mut client = ManagerServiceClient::connect(args.manager_address).await?;
+    let mut client = ManagerServiceClient::connect(args.manager_address.clone()).await?;
     info!("Successfully connected to manager.");
 
     let request = Request::new(DownloadRequest {
@@ -54,7 +48,10 @@ async fn main() -> Result<()> {
     let (mut file, pb) = if let Some(first_msg_result) = stream.next().await {
         let first_msg = first_msg_result?;
         if let Some(client_data_chunk::Payload::Metadata(metadata)) = first_msg.payload {
-            info!("Received metadata for job '{}'. File size: {} bytes.", metadata.job_id, metadata.file_size);
+            info!(
+                "Received metadata for job '{}'. File size: {} bytes.",
+                metadata.job_id, metadata.file_size
+            );
 
             let pb = ProgressBar::new(metadata.file_size);
             pb.set_style(
@@ -64,15 +61,20 @@ async fn main() -> Result<()> {
             );
 
             // Create and pre-allocate the output file
-            let file = OpenOptions::new().write(true).create(true).open(&args.output)?;
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&args.output)?;
             file.set_len(metadata.file_size)?;
-            
+
             Ok((file, pb))
         } else {
             Err(anyhow::anyhow!("First message from server was not metadata."))
         }
     } else {
-        Err(anyhow::anyhow!("Manager closed stream before sending metadata."))
+        Err(anyhow::anyhow!(
+            "Manager closed stream before sending metadata."
+        ))
     }?;
 
     // 2. Process subsequent data chunks.

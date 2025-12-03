@@ -18,6 +18,13 @@ pub mod error;
 /// Protobuf生成的消息
 pub mod proto;
 
+/// Client-side logic
+pub mod client;
+/// Manager-side logic
+pub mod manager;
+/// Server-side logic
+pub mod server;
+
 // 重新导出常用的类型
 pub use downloader::HttpDownloader;
 pub use error::DistributedDownloaderError;

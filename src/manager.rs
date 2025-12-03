@@ -1,13 +1,12 @@
+
 //! Main binary for the Manager node.
 
 use anyhow::Result;
-use clap::Parser;
 use std::time::Duration;
 use tonic::transport::Server;
 use tracing::{info, warn};
 
-use distributed_downloader::{
-    // config::ManagerConfig, // Removed
+use crate::{
     network::manager::{ManagerServiceImpl, ServerStatus},
     proto::distributed_downloader::{
         manager_command::Payload as ManagerPayload, manager_service_server::ManagerServiceServer,
@@ -16,12 +15,11 @@ use distributed_downloader::{
 };
 
 /// Command-line arguments for the manager.
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// Port for the manager to listen on.
     #[clap(short, long, default_value_t = 5000)]
-    port: u16,
+    pub port: u16,
 }
 
 /// The core scheduler loop.
@@ -112,13 +110,10 @@ async fn run_scheduler(service: ManagerServiceImpl) {
 }
 
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-    // info!("Loading manager configuration from: {}", args.config); // Removed
-    // let config = ManagerConfig::from_file(&args.config)?; // Removed
-    let addr = format!("0.0.0.0:{}", args.port).parse()?; // Fixed host to 0.0.0.0
+/// Runs the manager.
+pub async fn run(args: &Args) -> Result<()> {
+    // Note: Tracing is initialized in the main binary.
+    let addr = format!("0.0.0.0:{}", args.port).parse()?;
 
     let manager_service = ManagerServiceImpl::new();
 

@@ -88,7 +88,7 @@ cargo build --release
 
 在一个终端中启动 Manager：
 ```bash
-./target/release/manager --port 5000
+.\target\debug\ddr manager --port 5000
 ```
 Manager 将监听 `0.0.0.0:5000`。您可以通过 `--port` 参数指定其他端口。
 
@@ -97,10 +97,10 @@ Manager 将监听 `0.0.0.0:5000`。您可以通过 `--port` 参数指定其他�
 根据需要，在一个或多个终端中启动 Server 节点：
 ```bash
 # 启动第一个 Server
-./target/release/server --manager-address http://127.0.0.1:5000
+.\target\debug\ddr server --manager-address http://127.0.0.1:5000
 
 # 启动更多 Server...
-./target/release/server --manager-address http://127.0.0.1:5000
+.\target\debug\ddr server --manager-address http://127.0.0.1:5000
 ```
 Server 将连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `--manager-address` 参数指定 Manager 的地址。
 
@@ -108,12 +108,12 @@ Server 将连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `--man
 
 在另一个终端中，使用 Client 发起下载：
 ```bash
-./target/release/client <URL> -o <OUTPUT_FILE_PATH> --manager-address http://127.0.0.1:5000
+.\target\debug\ddr client <URL> -o <OUTPUT_FILE_PATH> --manager-address http://127.0.0.1:5000
 ```
 
 **示例**:
 ```bash
-./target/release/client "https://releases.ubuntu.com/22.04.1/ubuntu-22.04.1-desktop-amd64.iso" -o "ubuntu.iso" --manager-address http://127.0.0.1:5000
+.\target\debug\ddr client "https://releases.ubuntu.com/22.04.1/ubuntu-22.04.1-desktop-amd64.iso" -o "ubuntu.iso" --manager-address http://127.0.0.1:5000
 ```
 
 将 `<URL>` 替换为您要下载的文件URL，`<OUTPUT_FILE_PATH>` 替换为您希望保存的文件路径，`--manager-address` 指定 Manager 的地址。
@@ -122,9 +122,9 @@ Server 将连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `--man
 
 **示例下载命令**:
 ```bash
-cargo run --bin manager -- --port 5000
-cargo run --bin server -- --manager-address http://127.0.0.1:5000
-cargo run --bin client -- https://httpbin.org/json -o output.json --manager-address http://127.0.0.1:5000
+cargo run manager -- --port 5000
+cargo run server -- --manager-address http://127.0.0.1:5000
+cargo run client -- https://httpbin.org/json -o output.json --manager-address http://127.0.0.1:5000
 ```
 
 ## 构建和运行测试
@@ -147,10 +147,9 @@ cargo test --test integration_tests
 distributed-downloader/
 ├── src/
 │   ├── lib.rs
-│   ├── bin/
-│   │   ├── manager.rs
-│   │   ├── server.rs
-│   │   └── client.rs
+│   ├── client.rs
+│   ├── manager.rs
+│   ├── server.rs
 │   ├── network/
 │   ├── downloader/
 │   ├── utils/

@@ -1,6 +1,6 @@
+
 use anyhow::Result;
-use clap::Parser;
-use futures_util::StreamExt; // Added this back
+use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -8,8 +8,7 @@ use tonic::{transport::Endpoint, Request};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use distributed_downloader::{
-    // config::ServerConfig, // Removed
+use crate::{
     downloader::http::download_range,
     proto::distributed_downloader::{
         manager_command::Payload as ManagerPayload,
@@ -22,21 +21,16 @@ use distributed_downloader::{
 type ServerMessageSender = mpsc::Sender<ServerMessage>;
 
 /// Command-line arguments for the server.
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// Address of the manager (e.g., "http://127.0.0.1:5000").
     #[clap(short, long, default_value = "http://127.0.0.1:5000")]
-    manager_address: String,
+    pub manager_address: String,
 }
 
-/// Main entry point for the server.
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-    // info!("Loading config from: {}", args.config); // Removed
-    // let config = ServerConfig::from_file(&args.config)?; // Removed
+/// Runs the server.
+pub async fn run(args: &Args) -> Result<()> {
+    // Note: Tracing is initialized in the main binary.
     let server_id = Uuid::new_v4().to_string();
     info!("Generated server ID: {}", server_id);
 
@@ -55,7 +49,7 @@ async fn main() -> Result<()> {
 
 /// Connects to the manager, establishes a bidirectional stream, and listens for commands.
 async fn connect_and_listen(server_id: String, manager_address: String) -> Result<()> {
-    let channel = Endpoint::new(manager_address)?.connect().await?; // Removed size config
+    let channel = Endpoint::new(manager_address)?.connect().await?;
     let mut client = ManagerServiceClient::new(channel);
     info!("Successfully connected to manager.");
 
@@ -98,26 +92,22 @@ async fn handle_manager_command(command: ManagerCommand, tx: ServerMessageSender
     if let Some(ManagerPayload::AssignTask(task)) = command.payload {
         info!("Received download task: {}", task.task_id);
         tokio::spawn(async move {
-            // task.job_id.clone(); // No longer used directly here
-            // task.task_id.clone(); // No longer used directly here
-            // offset is task.range_start; // Used directly below
-
             let download_result = download_range(&task.url, task.range_start, task.range_end).await;
 
             let response_payload = match download_result {
                 Ok(data) => {
                     info!("Task {} downloaded {} bytes successfully.", task.task_id, data.len());
                     ServerPayload::ChunkData(ChunkData {
-                        job_id: task.job_id, // Get from task
-                        task_id: task.task_id, // Get from task
-                        offset: task.range_start, // Get from task
+                        job_id: task.job_id,
+                        task_id: task.task_id,
+                        offset: task.range_start,
                         data: data.into(),
                     })
                 }
                 Err(e) => {
                     error!("Task {} download failed: {}", task.task_id, e);
                     ServerPayload::TaskResult(TaskResult {
-                        task: Some(task), // Pass the entire task back
+                        task: Some(task),
                         success: false,
                         error_message: e.to_string(),
                     })
