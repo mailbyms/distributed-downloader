@@ -7,7 +7,7 @@ use tonic::transport::Server;
 use tracing::{info, warn};
 
 use distributed_downloader::{
-    config::ManagerConfig,
+    // config::ManagerConfig, // Removed
     network::manager::{ManagerServiceImpl, ServerStatus},
     proto::distributed_downloader::{
         manager_command::Payload as ManagerPayload, manager_service_server::ManagerServiceServer,
@@ -19,9 +19,9 @@ use distributed_downloader::{
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the manager configuration file.
-    #[clap(short, long, default_value = "configs/manager.yml")]
-    config: String,
+    /// Port for the manager to listen on.
+    #[clap(short, long, default_value_t = 5000)]
+    port: u16,
 }
 
 /// The core scheduler loop.
@@ -116,9 +116,9 @@ async fn run_scheduler(service: ManagerServiceImpl) {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    info!("Loading manager configuration from: {}", args.config);
-    let config = ManagerConfig::from_file(&args.config)?;
-    let addr = format!("{}:{}", config.manager_addr_ipv4, config.manager_port).parse()?;
+    // info!("Loading manager configuration from: {}", args.config); // Removed
+    // let config = ManagerConfig::from_file(&args.config)?; // Removed
+    let addr = format!("0.0.0.0:{}", args.port).parse()?; // Fixed host to 0.0.0.0
 
     let manager_service = ManagerServiceImpl::new();
 

@@ -1,3 +1,0 @@
-# Manager configuration example
-manager_addr_ipv4: 127.0.0.1
-manager_port: 5000

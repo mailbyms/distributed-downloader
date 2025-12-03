@@ -10,7 +10,7 @@
 - **持久连接**：Server 节点与 Manager 建立持久的双向 gRPC 流，用于注册和实时任务分发。
 - **流式数据传输**：下载的数据块通过流式 RPC 从 Server -> Manager -> Client 进行转发，高效且节省内存。
 - **动态任务分配**：Manager 将大文件切割为不大于 3MB 的标准块，并以轮询方式动态分配给所有可用的 Server 节点。
-- **配置管理**：基于 YAML 的清晰配置文件。
+- **命令行配置**：所有组件通过命令行参数进行配置，无需配置文件。
 - **错误处理**：全面的错误处理和日志记录。
 - **跨平台**：支持 Windows、macOS 和 Linux。
 - **高性能**：使用 Rust 和 Tokio 构建，确保内存安全和高并发性能。
@@ -29,14 +29,14 @@
 2.  **Server (服务器/工作节点)**：实际执行下载的节点。可以水平扩展（即同时运行多个）。它的职责是：
     *   启动时主动连接到 Manager，并注册自己。
     *   在持久的 gRPC 流上等待 Manager 分配下载任务。
-    *   根据任务指令（URL 和字节范围），下载文件分块到内存中。
+    *   根据任务指令（URL 和字节范围），下载文件分块到内存中，并实时显示进度。
     *   将下载好的数据块通过 gRPC 流回传给 Manager。
 
 3.  **Client (客户端)**：用户工具，用于发起下载。它的职责是：
     *   向 Manager 发送一次性的下载请求（包含 URL 和输出文件名）。
     *   与 Manager 建立一个数据流连接，并保持存活。
     *   首先接收 Manager 发来的文件元数据，并创建本地空文件。
-    *   持续接收 Manager 转发来的数据块，并根据偏移量写入文件的正确位置，直到下载完成。
+    *   持续接收 Manager 转发来的数据块，并根据偏移量写入文件的正确位置，直到下载完成，并实时显示进度。
 
 ### 系统工作流程
 
@@ -84,76 +84,79 @@ cargo build --release
 
 ## 使用方法
 
-### 1. 配置组件
-
-根据 `configs/` 目录中的示例创建每个组件的配置文件：
-
-- `configs/manager.yml`：管理器配置
-- `configs/server.yml`：服务器配置
-- `configs/client.yml`：客户端配置
-
-### 2. 启动管理器
+### 1. 启动管理器 (Manager)
 
 在一个终端中启动 Manager：
 ```bash
-./target/release/manager --config configs/manager.yml
+./target/release/manager --port 5000
 ```
+Manager 将监听 `0.0.0.0:5000`。您可以通过 `--port` 参数指定其他端口。
 
-### 3. 启动服务器
+### 2. 启动服务器 (Server)
 
 根据需要，在一个或多个终端中启动 Server 节点：
 ```bash
 # 启动第一个 Server
-./target/release/server --config configs/server.yml
+./target/release/server --manager-address http://127.0.0.1:5000
 
 # 启动更多 Server...
-./target/release/server --config configs/server.yml
+./target/release/server --manager-address http://127.0.0.1:5000
 ```
-您可以启动多个 Server 实例以提高下载速度。
+Server 将连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `--manager-address` 参数指定 Manager 的地址。
 
-### 4. 启动客户端下载
+### 3. 启动客户端 (Client) 下载
 
 在另一个终端中，使用 Client 发起下载：
 ```bash
-./target/release/client <URL> -o <OUTPUT_FILE_PATH>
+./target/release/client <URL> -o <OUTPUT_FILE_PATH> --manager-address http://127.0.0.1:5000
 ```
 
 **示例**:
 ```bash
-./target/release/client "https://releases.ubuntu.com/22.04.1/ubuntu-22.04.1-desktop-amd64.iso" -o "ubuntu.iso"
+./target/release/client "https://releases.ubuntu.com/22.04.1/ubuntu-22.04.1-desktop-amd64.iso" -o "ubuntu.iso" --manager-address http://127.0.0.1:5000
 ```
 
-将 `<URL>` 替换为您要下载的文件URL，`<OUTPUT_FILE_PATH>` 替换为您希望保存的文件路径。
+将 `<URL>` 替换为您要下载的文件URL，`<OUTPUT_FILE_PATH>` 替换为您希望保存的文件路径，`--manager-address` 指定 Manager 的地址。
 
-## 配置
+## 调试
 
-### Manager 配置 (`manager.yml`)
-
-```yaml
-# Manager 监听的 IP 地址和端口
-manager_addr_ipv4: 127.0.0.1
-manager_port: 5000
+**示例下载命令**:
+```bash
+cargo run --bin manager -- --port 5000
+cargo run --bin server -- --manager-address http://127.0.0.1:5000
+cargo run --bin client -- https://httpbin.org/json -o output.json --manager-address http://127.0.0.1:5000
 ```
 
-### Server 配置 (`server.yml`)
+## 构建和运行测试
 
-```yaml
-# 要连接的 Manager 的 IP 地址和端口
-manager_addr_ipv4: 127.0.0.1
-manager_port: 5000
+### 单元测试
 
-# Server 用于存储临时文件的目录 (当前版本未使用)
-tmp_dir: ./ddr-download/server/tmp/
-# 最终文件存放目录 (当前版本未使用)
-target_dir: ./ddr-download/server/target/
+```bash
+cargo test
 ```
 
-### Client 配置 (`client.yml`)
+### 集成测试
 
-```yaml
-# 要连接的 Manager 的 IP 地址和端口
-manager_addr_ipv4: 127.0.0.1
-manager_port: 5000
+```bash
+cargo test --test integration_tests
+```
+
+## 项目结构
+
+```
+distributed-downloader/
+├── src/
+│   ├── lib.rs
+│   ├── bin/
+│   │   ├── manager.rs
+│   │   ├── server.rs
+│   │   └── client.rs
+│   ├── network/
+│   ├── downloader/
+│   ├── utils/
+│   └── error/
+├── ReadmeFig/
+└── Cargo.toml
 ```
 
 ## 技术栈
@@ -162,7 +165,6 @@ manager_port: 5000
 - **异步运行时**: Tokio
 - **网络通信**: gRPC / Tonic / Protobuf
 - **HTTP客户端**: reqwest
-- **序列化**: serde (YAML)
 - **命令行解析**: clap
 - **日志**: tracing
 - **进度显示**: indicatif
@@ -170,7 +172,7 @@ manager_port: 5000
 ## 已知限制
 
 1. 当前实现仅支持HTTP/HTTPS协议。
-2. 暂不支持断点续传功能。
+2. 暂不支持断点续传功能（除非整个下载在 Manager 端记录进度）。
 3. 缺少图形用户界面。
 
 ## 未来改进

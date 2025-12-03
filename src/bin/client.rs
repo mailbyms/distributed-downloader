@@ -1,19 +1,16 @@
 //! Client binary for the Distributed Downloader.
-//!
-//! This binary sends a download request to the manager and remains connected
-//! to receive the downloaded file data, writing it to the output file.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::Parser;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use tonic::Request;
 use tracing::{info, warn};
 
 use distributed_downloader::{
-    config::ClientConfig,
+    // config::ClientConfig, // Removed
     proto::distributed_downloader::{
         client_data_chunk, manager_service_client::ManagerServiceClient, DownloadRequest,
     },
@@ -31,23 +28,18 @@ struct Args {
     #[clap(short, long)]
     output: String,
 
-    /// Path to the client configuration file.
-    #[clap(short, long, default_value = "configs/client.yml")]
-    config: String,
+    /// Address of the manager (e.g., "http://127.0.0.1:5000").
+    #[clap(short, long, default_value = "http://127.0.0.1:5000")]
+    manager_address: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging.
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    info!("Loading client configuration from: {}", args.config);
-    let config = ClientConfig::from_file(&args.config)?;
-    let manager_address = format!("http://{}:{}", config.manager_addr_ipv4, config.manager_port);
-
-    info!("Connecting to manager at {}...", manager_address);
-    let mut client = ManagerServiceClient::connect(manager_address).await?;
+    info!("Connecting to manager at {}...", args.manager_address);
+    let mut client = ManagerServiceClient::connect(args.manager_address).await?;
     info!("Successfully connected to manager.");
 
     let request = Request::new(DownloadRequest {
@@ -65,9 +57,11 @@ async fn main() -> Result<()> {
             info!("Received metadata for job '{}'. File size: {} bytes.", metadata.job_id, metadata.file_size);
 
             let pb = ProgressBar::new(metadata.file_size);
-            pb.set_style(ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
-                .progress_chars("#>-"));
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+                    .progress_chars("#>-"),
+            );
 
             // Create and pre-allocate the output file
             let file = OpenOptions::new().write(true).create(true).open(&args.output)?;
@@ -75,10 +69,10 @@ async fn main() -> Result<()> {
             
             Ok((file, pb))
         } else {
-            Err(anyhow!("First message from server was not metadata."))
+            Err(anyhow::anyhow!("First message from server was not metadata."))
         }
     } else {
-        Err(anyhow!("Manager closed stream before sending metadata."))
+        Err(anyhow::anyhow!("Manager closed stream before sending metadata."))
     }?;
 
     // 2. Process subsequent data chunks.

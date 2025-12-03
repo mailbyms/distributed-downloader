@@ -3,9 +3,6 @@
 //! 这个crate提供了分布式文件下载系统的核心功能
 //! 包含管理器、服务器和客户端组件。
 
-/// 所有组件的配置模块
-pub mod config;
-
 /// 网络通信模块
 pub mod network;
 
@@ -22,6 +19,5 @@ pub mod error;
 pub mod proto;
 
 // 重新导出常用的类型
-pub use config::{ClientConfig, ServerConfig, ManagerConfig};
 pub use downloader::HttpDownloader;
 pub use error::DistributedDownloaderError;

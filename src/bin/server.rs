@@ -1,8 +1,6 @@
-//! Server binary for the Distributed Downloader.
-
 use anyhow::Result;
 use clap::Parser;
-use futures_util::StreamExt;
+use futures_util::StreamExt; // Added this back
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -11,7 +9,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use distributed_downloader::{
-    config::ServerConfig,
+    // config::ServerConfig, // Removed
     downloader::http::download_range,
     proto::distributed_downloader::{
         manager_command::Payload as ManagerPayload,
@@ -27,9 +25,9 @@ type ServerMessageSender = mpsc::Sender<ServerMessage>;
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the server configuration file.
-    #[clap(short, long, default_value = "configs/server.yml")]
-    config: String,
+    /// Address of the manager (e.g., "http://127.0.0.1:5000").
+    #[clap(short, long, default_value = "http://127.0.0.1:5000")]
+    manager_address: String,
 }
 
 /// Main entry point for the server.
@@ -37,17 +35,17 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    info!("Loading config from: {}", args.config);
-    let config = ServerConfig::from_file(&args.config)?;
+    // info!("Loading config from: {}", args.config); // Removed
+    // let config = ServerConfig::from_file(&args.config)?; // Removed
     let server_id = Uuid::new_v4().to_string();
     info!("Generated server ID: {}", server_id);
 
     loop {
         info!(
             "Attempting to connect to manager at: {}",
-            format!("http://{}:{}", config.manager_addr_ipv4, config.manager_port)
+            args.manager_address
         );
-        match connect_and_listen(server_id.clone(), config.clone()).await {
+        match connect_and_listen(server_id.clone(), args.manager_address.clone()).await {
             Ok(_) => warn!("Stream closed. Reconnecting in 5s."),
             Err(e) => error!("Connection failed: {}. Retrying in 5s.", e),
         }
@@ -56,13 +54,8 @@ async fn main() -> Result<()> {
 }
 
 /// Connects to the manager, establishes a bidirectional stream, and listens for commands.
-async fn connect_and_listen(server_id: String, config: ServerConfig) -> Result<()> {
-    let address = format!(
-        "http://{}:{}",
-        config.manager_addr_ipv4, config.manager_port
-    );
-
-    let channel = Endpoint::new(address)?.connect().await?;
+async fn connect_and_listen(server_id: String, manager_address: String) -> Result<()> {
+    let channel = Endpoint::new(manager_address)?.connect().await?; // Removed size config
     let mut client = ManagerServiceClient::new(channel);
     info!("Successfully connected to manager.");
 
@@ -105,8 +98,9 @@ async fn handle_manager_command(command: ManagerCommand, tx: ServerMessageSender
     if let Some(ManagerPayload::AssignTask(task)) = command.payload {
         info!("Received download task: {}", task.task_id);
         tokio::spawn(async move {
-            let task_for_result = task.clone(); // Clone for potential failure report
-            let offset = task.range_start;
+            // task.job_id.clone(); // No longer used directly here
+            // task.task_id.clone(); // No longer used directly here
+            // offset is task.range_start; // Used directly below
 
             let download_result = download_range(&task.url, task.range_start, task.range_end).await;
 
@@ -114,16 +108,16 @@ async fn handle_manager_command(command: ManagerCommand, tx: ServerMessageSender
                 Ok(data) => {
                     info!("Task {} downloaded {} bytes successfully.", task.task_id, data.len());
                     ServerPayload::ChunkData(ChunkData {
-                        job_id: task.job_id,
-                        task_id: task.task_id,
-                        offset,
+                        job_id: task.job_id, // Get from task
+                        task_id: task.task_id, // Get from task
+                        offset: task.range_start, // Get from task
                         data: data.into(),
                     })
                 }
                 Err(e) => {
                     error!("Task {} download failed: {}", task.task_id, e);
                     ServerPayload::TaskResult(TaskResult {
-                        task: Some(task_for_result),
+                        task: Some(task), // Pass the entire task back
                         success: false,
                         error_message: e.to_string(),
                     })
