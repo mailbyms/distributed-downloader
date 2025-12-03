@@ -1,4 +1,4 @@
-//! Unit tests for utility modules
+//! 实用模块的单元测试
 
 #[cfg(test)]
 mod tests {
@@ -10,7 +10,7 @@ mod tests {
 
     #[test]
     fn test_download_distributor() {
-        // Test normal distribution
+        // 测试正常分配
         let intervals = DownloadDistributor::download_interval_list(0, 99, 4);
         assert_eq!(intervals.len(), 4);
         assert_eq!(intervals[0], [0, 24]);
@@ -18,7 +18,7 @@ mod tests {
         assert_eq!(intervals[2], [50, 74]);
         assert_eq!(intervals[3], [75, 99]);
 
-        // Test distribution with remainder
+        // 测试带余数的分配
         let intervals = DownloadDistributor::download_interval_list(0, 100, 3);
         assert_eq!(intervals.len(), 3);
         assert_eq!(intervals[0], [0, 33]);
@@ -29,7 +29,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Number of parts")]
     fn test_download_distributor_panic() {
-        // This should panic because number of parts > file size
+        // 这应该会恐慌，因为部分数量 > 文件大小
         DownloadDistributor::download_interval_list(0, 5, 10);
     }
 
@@ -39,34 +39,34 @@ mod tests {
         let test_dir = temp_dir.path().join("test_dir");
         let test_dir_str = test_dir.to_str().unwrap();
 
-        // Test create_dir
+        // 测试 create_dir
         assert!(create_dir(test_dir_str).is_ok());
         assert!(test_dir.exists());
 
-        // Test remove_dir
+        // 测试 remove_dir
         assert!(remove_dir(test_dir_str).is_ok());
         assert!(!test_dir.exists());
 
-        // Test append_files
+        // 测试 append_files
         let file1_path = temp_dir.path().join("file1.txt");
         let file2_path = temp_dir.path().join("file2.txt");
         let target_path = temp_dir.path().join("target.txt");
 
-        // Create test files
+        // 创建测试文件
         fs::write(&file1_path, "Hello ").unwrap();
         fs::write(&file2_path, "World!").unwrap();
 
-        // Test append_files
+        // 测试 append_files
         assert!(append_files(
             &[file1_path.to_str().unwrap().to_string(), file2_path.to_str().unwrap().to_string()],
             target_path.to_str().unwrap()
         ).is_ok());
 
-        // Check result
+        // 检查结果
         let content = fs::read_to_string(&target_path).unwrap();
         assert_eq!(content, "Hello World!");
 
-        // Test delete_file
+        // 测试 delete_file
         assert!(delete_file(target_path.to_str().unwrap()).is_ok());
         assert!(!target_path.exists());
     }

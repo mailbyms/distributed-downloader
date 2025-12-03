@@ -2,91 +2,93 @@ syntax = "proto3";
 
 package distributed_downloader;
 
-// Server注册消息
-message ServerRegister {
-  uint32 server_id = 1;
+// The main service running on the Manager node.
+service ManagerService {
+    // A client calls this to initiate a new download. The manager will then
+    // stream the downloaded data chunks back to the client.
+    rpc RequestDownload(DownloadRequest) returns (stream ClientDataChunk);
+
+    // A server calls this to establish a persistent, bidirectional connection.
+    rpc EstablishConnection(stream ServerMessage) returns (stream ManagerCommand);
 }
 
-// Server下线消息
-message ServerDown {
-  uint32 server_id = 1;
-}
+// ============== Client-to-Manager Messages ==============
 
-// Server信息
-message ServerInfo {
-  uint32 id = 1;
-}
-
-// 下载请求
 message DownloadRequest {
-  string url = 1;
+    string url = 1;
+    string output_file = 2;
 }
 
-// 文件信息响应
-message FileInfoResponse {
-  uint64 file_size = 1;
-  uint32 chunk_count = 2;
-  repeated uint64 chunk_sizes = 3;
-  string final_url = 4;
+// Message streamed from Manager back to Client, containing file data.
+message ClientDataChunk {
+    oneof payload {
+        // The first message sent to the client, containing metadata.
+        FileMetadata metadata = 1;
+        // Subsequent messages containing the actual file data.
+        DataChunk chunk = 2;
+    }
 }
 
-// 下载元数据
-message DownloadMetadata {
-  string url = 1;
-  uint64 start_position = 2;
-  uint64 end_position = 3;
+message FileMetadata {
+    string job_id = 1;
+    uint64 file_size = 2;
 }
 
-// 下载任务
-message DownloadTask {
-  string url = 1;
-  uint64 start_position = 2;
-  uint64 end_position = 3;
-  string task_id = 4;
+message DataChunk {
+    string job_id = 1;
+    uint64 offset = 2;
+    bytes data = 3;
 }
 
-// 任务结果
+
+// ============== Server-to-Manager Stream Messages ==============
+
+message ServerMessage {
+    oneof payload {
+        // The first message sent by a server to register itself.
+        ServerRegistration register = 1;
+        // A message to report that a task is complete.
+        TaskResult task_result = 2;
+        // A message containing the data from a downloaded chunk.
+        ChunkData chunk_data = 3;
+    }
+}
+
+message ServerRegistration {
+    string server_id = 1;
+    string address = 2;
+}
+
+// Sent from Server to Manager to report the downloaded chunk's data.
+message ChunkData {
+    string job_id = 1;
+    string task_id = 2;
+    uint64 offset = 3;
+    bytes data = 4;
+}
+
+// Sent from Server to Manager to report a task's final status.
 message TaskResult {
-  string task_id = 1;
-  bool success = 2;
-  string error_message = 3;
+    string job_id = 1;
+    string task_id = 2;
+    bool success = 3;
+    string error_message = 4;
 }
 
-// 初始命令类型
-enum CommandType {
-  UNKNOWN = 0;
-  SERVER_REGISTER = 1;
-  SERVER_DOWN = 2;
-  DOWNLOAD_REQUEST = 3;
+
+// ============== Manager-to-Server Stream Messages ==============
+
+message ManagerCommand {
+    oneof payload {
+        // A command assigning a new download task to the server.
+        DownloadTask assign_task = 1;
+    }
 }
 
-// 初始命令消息
-message InitialCommand {
-  CommandType command_type = 1;
-}
-
-// 通用消息包装器
-message Message {
-  oneof payload {
-    // Initial command
-    InitialCommand initial_command = 1;
-
-    // Manager to Server messages
-    ServerRegister server_register = 2;
-    DownloadTask download_task = 3;
-
-    // Server to Manager messages
-    ServerInfo server_info = 4;
-    ServerDown server_down = 5;
-    TaskResult task_result = 6;
-
-    // Client to Manager messages
-    DownloadRequest download_request = 7;
-
-    // Manager to Client messages
-    FileInfoResponse file_info_response = 8;
-
-    // Data transfer
-    bytes file_data = 9;
-  }
+message DownloadTask {
+    string job_id = 1;
+    string task_id = 2;
+    string url = 3;
+    uint64 range_start = 4;
+    uint64 range_end = 5;
 }

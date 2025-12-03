@@ -1,96 +1,101 @@
-//! Client binary
+//! Client binary for the Distributed Downloader.
+//!
+//! This binary sends a download request to the manager and remains connected
+//! to receive the downloaded file data, writing it to the output file.
 
+use anyhow::{anyhow, Result};
 use clap::Parser;
-use distributed_downloader::config::ClientConfig;
-use distributed_downloader::network::{ClientNetwork};
-use distributed_downloader::utils::{create_dir, remove_dir};
-use tracing::info;
-use tracing_subscriber;
+use futures_util::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
+use tonic::Request;
+use tracing::{info, warn};
 
-use std::time::Instant;
+use distributed_downloader::{
+    config::ClientConfig,
+    proto::distributed_downloader::{
+        client_data_chunk, manager_service_client::ManagerServiceClient, DownloadRequest,
+    },
+};
 
-/// Distributed Downloader Client
+/// Command-line arguments for the client.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// URL to download
+    /// The URL of the file to download.
     #[clap()]
     url: String,
 
-    /// Path to the configuration file
+    /// The output file name.
+    #[clap(short, long)]
+    output: String,
+
+    /// Path to the client configuration file.
     #[clap(short, long, default_value = "configs/client.yml")]
     config: String,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), distributed_downloader::error::DistributedDownloaderError> {
-    // Initialize logging
+async fn main() -> Result<()> {
+    // Initialize logging.
     tracing_subscriber::fmt::init();
-
     let args = Args::parse();
 
-    // Load configuration
+    info!("Loading client configuration from: {}", args.config);
     let config = ClientConfig::from_file(&args.config)?;
+    let manager_address = format!("http://{}:{}", config.manager_addr_ipv4, config.manager_port);
 
-    // Create working directories
-    create_work_dirs(&config)?;
+    info!("Connecting to manager at {}...", manager_address);
+    let mut client = ManagerServiceClient::connect(manager_address).await?;
+    info!("Successfully connected to manager.");
 
-    // Extract filename from URL
-    let filename = extract_filename(&args.url);
-    let final_file_path = format!("{}{}", config.target_dir, filename);
+    let request = Request::new(DownloadRequest {
+        url: args.url.clone(),
+        output_file: args.output.clone(),
+    });
 
-    // Use the new download method
-    info!("Sending download request to manager");
+    info!("Sending download request to manager...");
+    let mut stream = client.request_download(request).await?.into_inner();
 
-    // Start download timer
-    let start_time = Instant::now();
+    // 1. Wait for the first message (metadata) to set up the file and progress bar.
+    let (mut file, pb) = if let Some(first_msg_result) = stream.next().await {
+        let first_msg = first_msg_result?;
+        if let Some(client_data_chunk::Payload::Metadata(metadata)) = first_msg.payload {
+            info!("Received metadata for job '{}'. File size: {} bytes.", metadata.job_id, metadata.file_size);
 
-    // Request download through manager
-    ClientNetwork::request_download_via_manager(
-        &config.manager_addr_ipv4,
-        config.manager_port,
-        &args.url,
-        &final_file_path,
-    ).await?;
+            let pb = ProgressBar::new(metadata.file_size);
+            pb.set_style(ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+                .progress_chars("#>-"));
 
-    info!("File has been downloaded");
+            // Create and pre-allocate the output file
+            let file = OpenOptions::new().write(true).create(true).open(&args.output)?;
+            file.set_len(metadata.file_size)?;
+            
+            Ok((file, pb))
+        } else {
+            Err(anyhow!("First message from server was not metadata."))
+        }
+    } else {
+        Err(anyhow!("Manager closed stream before sending metadata."))
+    }?;
 
-    // Calculate download speed
-    let duration = start_time.elapsed();
-    let file_size = std::fs::metadata(&final_file_path)?.len() as f64 / (1024.0 * 1024.0); // MB
-    let speed = file_size / duration.as_secs_f64();
+    // 2. Process subsequent data chunks.
+    while let Some(msg_result) = stream.next().await {
+        let msg = msg_result?;
+        if let Some(client_data_chunk::Payload::Chunk(chunk)) = msg.payload {
+            file.seek(SeekFrom::Start(chunk.offset))?;
+            file.write_all(&chunk.data)?;
+            pb.inc(chunk.data.len() as u64);
+        } else {
+            // This case should ideally not be reached if the server adheres to the protocol.
+            warn!("Received a non-chunk message after metadata.");
+        }
+    }
 
-    info!("\n\nDownload speed = {:.2} MB/s", speed);
-    info!("Time = {:.2} seconds", duration.as_secs_f64());
-
-    // Clean up temporary directory
-    remove_dir(&config.tmp_dir)?;
+    pb.finish_with_message("Download complete");
+    info!("File '{}' has been downloaded successfully.", args.output);
 
     Ok(())
 }
-
-/// Create working directories
-fn create_work_dirs(config: &ClientConfig) -> Result<(), distributed_downloader::error::DistributedDownloaderError> {
-    if !config.target_dir.is_empty() {
-        create_dir(&config.target_dir)?;
-    } else {
-        eprintln!("Error: Please provide download path in config file.");
-        std::process::exit(1);
-    }
-
-    if !config.tmp_dir.is_empty() {
-        create_dir(&config.tmp_dir)?;
-    } else {
-        eprintln!("Error: Please provide temp path in config file.");
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-/// Extract filename from URL
-fn extract_filename(url: &str) -> String {
-    let path = url.split('/').last().unwrap_or("downloaded_file");
-    path.replace("%20", "_")
-}
-

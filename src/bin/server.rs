@@ -1,96 +1,142 @@
-//! Server binary
+//! Server binary for the Distributed Downloader.
 
+use anyhow::Result;
 use clap::Parser;
-use distributed_downloader::config::ServerConfig;
-use distributed_downloader::network::ServerNetwork;
-use distributed_downloader::utils::create_dir;
-use tracing::{info, error};
-use tracing_subscriber;
-use tokio::time;
+use futures_util::StreamExt;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{transport::Endpoint, Request};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
-/// Distributed Downloader Server
+use distributed_downloader::{
+    config::ServerConfig,
+    downloader::http::download_range,
+    proto::distributed_downloader::{
+        manager_command::Payload as ManagerPayload,
+        manager_service_client::ManagerServiceClient,
+        server_message::Payload as ServerPayload, ChunkData, ManagerCommand, ServerMessage,
+        ServerRegistration, TaskResult,
+    },
+};
+
+type ServerMessageSender = mpsc::Sender<ServerMessage>;
+
+/// Command-line arguments for the server.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the configuration file
+    /// Path to the server configuration file.
     #[clap(short, long, default_value = "configs/server.yml")]
     config: String,
 }
 
+/// Main entry point for the server.
 #[tokio::main]
-async fn main() -> Result<(), distributed_downloader::error::DistributedDownloaderError> {
-    // Initialize logging
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-
     let args = Args::parse();
-
-    // Load configuration
+    info!("Loading config from: {}", args.config);
     let config = ServerConfig::from_file(&args.config)?;
+    let server_id = Uuid::new_v4().to_string();
+    info!("Generated server ID: {}", server_id);
 
-    // Create working directories
-    create_work_dirs(&config)?;
-
-    // Create server network handler
-    let mut server = ServerNetwork::new(
-        config.id,
-        config.tmp_dir.clone(),
-        config.target_dir.clone(),
-        config.threads_num,
-    );
-
-    // Set manager and server info
-    server.set_manager_info(config.manager_addr_ipv4.clone(), config.manager_port);
-
-    // Attempt to establish connection with manager, with retry logic
-    // The establish_long_connection function will also handle task listening
     loop {
-        info!("Establishing long connection with manager...");
-
-        match server.establish_long_connection().await {
-            Ok(()) => {
-                info!("Successfully connected to manager and listening for tasks");
-                break; // Successfully connected and listening, exit the retry loop
-            }
-            Err(e) => {
-                error!("Error establishing connection with manager: {}", e);
-                info!("Retrying connection in 5 seconds...");
-                time::sleep(time::Duration::from_secs(5)).await;
-                // Continue the loop to retry connection
-            }
+        info!(
+            "Attempting to connect to manager at: {}",
+            format!("http://{}:{}", config.manager_addr_ipv4, config.manager_port)
+        );
+        match connect_and_listen(server_id.clone(), config.clone()).await {
+            Ok(_) => warn!("Stream closed. Reconnecting in 5s."),
+            Err(e) => error!("Connection failed: {}. Retrying in 5s.", e),
         }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
-
-    // Keep the server running and periodically check connection health
-    // Note: In the current implementation, the server's main connection is used for listening to tasks,
-    // so we can't use it for sending heartbeats without interfering with task listening.
-    // A more advanced implementation would use a separate connection for heartbeats.
-    loop {
-        // Sleep for a while before checking connection health
-        time::sleep(time::Duration::from_secs(30)).await;
-
-        // In a more advanced implementation, we would check the connection health here
-        // and attempt to reconnect if needed. For now, we'll just keep the server running.
-        info!("Server is still running");
-    }
-
 }
 
-/// Create working directories
-fn create_work_dirs(config: &ServerConfig) -> Result<(), distributed_downloader::error::DistributedDownloaderError> {
-    if !config.target_dir.is_empty() {
-        create_dir(&config.target_dir)?;
-    } else {
-        eprintln!("Error: Please provide download path in config file.");
-        std::process::exit(1);
-    }
+/// Connects to the manager, establishes a bidirectional stream, and listens for commands.
+async fn connect_and_listen(server_id: String, config: ServerConfig) -> Result<()> {
+    let address = format!(
+        "http://{}:{}",
+        config.manager_addr_ipv4, config.manager_port
+    );
 
-    if !config.tmp_dir.is_empty() {
-        create_dir(&config.tmp_dir)?;
-    } else {
-        eprintln!("Error: Please provide temp path in config file.");
-        std::process::exit(1);
+    let channel = Endpoint::new(address)?.connect().await?;
+    let mut client = ManagerServiceClient::new(channel);
+    info!("Successfully connected to manager.");
+
+    let (tx, rx) = mpsc::channel(10); // Outbound channel
+    let outbound_stream = ReceiverStream::new(rx);
+
+    let registration = ServerRegistration {
+        server_id: server_id.clone(),
+        address: "self-reported-address:port".to_string(),
+    };
+    tx.send(ServerMessage {
+        payload: Some(ServerPayload::Register(registration)),
+    })
+    .await?;
+    info!("Sent registration message.");
+
+    let response = client
+        .establish_connection(Request::new(outbound_stream))
+        .await?;
+    let mut inbound_stream = response.into_inner();
+    info!("Connection established. Listening for commands...");
+
+    while let Some(result) = inbound_stream.next().await {
+        match result {
+            Ok(command) => {
+                handle_manager_command(command, tx.clone()).await;
+            }
+            Err(status) => {
+                error!("Error from manager: {}", status);
+                break;
+            }
+        }
     }
 
     Ok(())
 }
 
+/// Handles a single command from the manager by spawning a worker task.
+async fn handle_manager_command(command: ManagerCommand, tx: ServerMessageSender) {
+    if let Some(ManagerPayload::AssignTask(task)) = command.payload {
+        info!("Received download task: {}", task.task_id);
+        tokio::spawn(async move {
+            let job_id = task.job_id.clone();
+            let task_id = task.task_id.clone();
+            let offset = task.range_start;
+
+            let download_result = download_range(&task.url, task.range_start, task.range_end).await;
+
+            let response_payload = match download_result {
+                Ok(data) => {
+                    info!("Task {} downloaded {} bytes successfully.", task_id, data.len());
+                    ServerPayload::ChunkData(ChunkData {
+                        job_id,
+                        task_id,
+                        offset,
+                        data: data.into(),
+                    })
+                }
+                Err(e) => {
+                    error!("Task {} download failed: {}", task_id, e);
+                    ServerPayload::TaskResult(TaskResult {
+                        job_id,
+                        task_id,
+                        success: false,
+                        error_message: e.to_string(),
+                    })
+                }
+            };
+            
+            if tx.send(ServerMessage { payload: Some(response_payload) }).await.is_err() {
+                warn!("Failed to send task result back to manager. Connection may be closed.");
+            }
+        });
+    } else {
+        warn!("Received an empty or unknown command.");
+    }
+}

@@ -1,4 +1,4 @@
-//! Integration tests for the distributed downloader
+//! 分布式下载器的集成测试
 
 #[cfg(test)]
 mod tests {
@@ -6,40 +6,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_end_to_end_download() {
-        // This would be an end-to-end test that:
-        // 1. Starts a manager
-        // 2. Starts a server
-        // 3. Starts a client that downloads a file
-        // 4. Verifies the download was successful
+        // 这将是一个端到端测试，包括：
+        // 1. 启动管理器
+        // 2. 启动服务器
+        // 3. 启动客户端下载文件
+        // 4. 验证下载成功
         //
-        // Due to the complexity of setting up the full environment,
-        // this test is left as a placeholder for future implementation.
+        // 由于设置完整环境的复杂性，
+        // 此测试留作未来实现的占位符。
         assert!(true);
     }
 
     #[tokio::test]
     async fn test_manager_server_communication() {
-        // This would test the communication between manager and server:
-        // 1. Start manager
-        // 2. Start server and notify manager
-        // 3. Verify server is registered with manager
+        // 这将测试管理器和服务器之间的通信：
+        // 1. 启动管理器
+        // 2. 启动服务器并通知管理器
+        // 3. 验证服务器已在管理器中注册
         //
-        // Due to the complexity of setting up the full environment,
-        // this test is left as a placeholder for future implementation.
+        // 由于设置完整环境的复杂性，
+        // 此测试留作未来实现的占位符。
         assert!(true);
     }
 
     #[tokio::test]
     async fn test_client_server_communication() {
-        // This would test the communication between client and server:
-        // 1. Start manager with registered server
-        // 2. Start client and request server list
-        // 3. Client connects to server and requests download
-        // 4. Server downloads and sends file segment
-        // 5. Client receives and verifies file segment
+        // 这将测试客户端和服务器之间的通信：
+        // 1. 启动带有已注册服务器的管理器
+        // 2. 启动客户端并请求服务器列表
+        // 3. 客户端连接到服务器并请求下载
+        // 4. 服务器下载并发送文件段
+        // 5. 客户端接收并验证文件段
         //
-        // Due to the complexity of setting up the full environment,
-        // this test is left as a placeholder for future implementation.
+        // 由于设置完整环境的复杂性，
+        // 此测试留作未来实现的占位符。
         assert!(true);
     }
 }

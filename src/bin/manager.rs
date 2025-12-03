@@ -1,50 +1,49 @@
-//! Manager binary
+//! Main binary for the Manager node.
+//!
+//! This binary starts the gRPC ManagerService, which listens for connections
+//! from clients (to start downloads) and servers (to register for work).
 
+use anyhow::Result;
 use clap::Parser;
-use distributed_downloader::config::ManagerConfig;
-use distributed_downloader::network::ManagerNetwork;
+use tonic::transport::Server;
 use tracing::info;
-use tracing_subscriber;
 
-use std::net::TcpStream;
+use distributed_downloader::{
+    config::ManagerConfig,
+    network::manager::ManagerServiceImpl,
+    proto::distributed_downloader::manager_service_server::ManagerServiceServer,
+};
 
-/// Distributed Downloader Manager
+/// Command-line arguments for the manager.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the configuration file
+    /// Path to the manager configuration file.
     #[clap(short, long, default_value = "configs/manager.yml")]
     config: String,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), distributed_downloader::error::DistributedDownloaderError> {
-    // Initialize logging
+async fn main() -> Result<()> {
+    // Initialize logging.
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-
-    // Load configuration
+    info!("Loading manager configuration from: {}", args.config);
     let config = ManagerConfig::from_file(&args.config)?;
 
-    // Get manager IP address
-    let manager_addr_ipv4 = get_local_ip()?;
-    info!("Manager IP address: {}", manager_addr_ipv4);
+    let addr = format!("{}:{}", config.manager_addr_ipv4, config.manager_port).parse()?;
+    let manager_service = ManagerServiceImpl::new();
+    let svc = ManagerServiceServer::new(manager_service)
+        .max_decoding_message_size(16 * 1024 * 1024); // 16 MB
 
-    // Create manager network handler
-    let manager = ManagerNetwork::new();
+    info!("Manager gRPC service listening on {}", addr);
 
-    info!("Starting manager on {}:{}", config.manager_addr_ipv4, config.manager_port);
-    // Start listening
-    manager.listen(&config.manager_addr_ipv4, config.manager_port).await?;
+    // Build and start the tonic gRPC server.
+    Server::builder()
+        .add_service(svc)
+        .serve(addr)
+        .await?;
 
     Ok(())
-}
-
-/// Get local IP address
-fn get_local_ip() -> Result<String, distributed_downloader::error::DistributedDownloaderError> {
-    // Try to connect to a remote address to determine local IP
-    let socket = TcpStream::connect("8.8.8.8:53")?;
-    let local_addr = socket.local_addr()?;
-    Ok(local_addr.ip().to_string())
 }

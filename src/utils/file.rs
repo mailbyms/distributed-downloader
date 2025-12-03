@@ -1,11 +1,11 @@
-//! File operation utilities
+//! 文件操作工具
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
 use crate::error::Result;
 
-/// Create directory if it doesn't exist
+/// 如果目录不存在则创建目录
 pub fn create_dir(dirname: &str) -> Result<()> {
     if !Path::new(dirname).exists() {
         fs::create_dir_all(dirname)?;
@@ -13,7 +13,7 @@ pub fn create_dir(dirname: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove directory
+/// 删除目录
 pub fn remove_dir(dirname: &str) -> Result<()> {
     if Path::new(dirname).exists() {
         fs::remove_dir(dirname)?;
@@ -21,7 +21,7 @@ pub fn remove_dir(dirname: &str) -> Result<()> {
     Ok(())
 }
 
-/// Append multiple files to a target file
+/// 将多个文件追加到目标文件
 pub fn append_files(src_paths: &[String], target_path: &str) -> Result<()> {
     let mut target_file = File::create(target_path)?;
 
@@ -35,7 +35,7 @@ pub fn append_files(src_paths: &[String], target_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Delete a file
+/// 删除文件
 pub fn delete_file(path: &str) -> Result<()> {
     if Path::new(path).exists() {
         fs::remove_file(path)?;

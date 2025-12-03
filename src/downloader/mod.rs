@@ -1,4 +1,4 @@
-//! Download module
+//! 下载模块
 
 pub mod http;
 

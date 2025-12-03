@@ -1,4 +1,4 @@
-# Server configuration example
+# 服务器配置示例
 id: 1
 manager_addr_ipv4: 127.0.0.1
 manager_port: 5000

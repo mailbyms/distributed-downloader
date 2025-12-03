@@ -1,50 +1,92 @@
-//! Download range distributor
+//! Contains the logic for distributing download tasks to available servers.
 
-/// Download distributor for dividing file ranges among multiple parts
-pub struct DownloadDistributor;
+use anyhow::{anyhow, Result};
+use tracing::{info, warn, error};
+use uuid::Uuid;
 
-impl DownloadDistributor {
-    /// Calculate download intervals for multiple parts
-    ///
-    /// This function divides the range [left_point, right_point] into number_of_parts chunks
-    /// and returns a vector of intervals [start, end] for each part.
-    pub fn download_interval_list(left_point: u64, right_point: u64, number_of_parts: usize) -> Vec<[u64; 2]> {
-        let length = right_point - left_point + 1;
+use crate::{
+    network::manager::ConnectionManager,
+    proto::distributed_downloader::{
+        manager_command::Payload as ManagerPayload, DownloadTask, ManagerCommand,
+    },
+};
 
-        // If length is less than number_of_parts, we can't divide properly
-        if length < number_of_parts as u64 {
-            panic!("Number of parts ({}) is greater than file size ({})", number_of_parts, length);
+const MAX_CHUNK_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
+
+/// The Distributor is responsible for splitting a download job into tasks
+/// and dispatching them to available servers.
+#[derive(Debug)]
+pub struct Distributor {
+    connections: ConnectionManager,
+}
+
+impl Distributor {
+    /// Creates a new Distributor.
+    pub fn new(connections: ConnectionManager) -> Self {
+        Self { connections }
+    }
+
+    /// Generates a list of byte range tasks for a given file size,
+    /// ensuring no task is larger than MAX_CHUNK_SIZE.
+    fn generate_tasks(file_size: u64) -> Vec<(u64, u64)> {
+        let mut tasks = Vec::new();
+        let mut current_pos = 0;
+
+        while current_pos < file_size {
+            let end_pos = (current_pos + MAX_CHUNK_SIZE - 1).min(file_size - 1);
+            tasks.push((current_pos, end_pos));
+            current_pos = end_pos + 1;
+        }
+        tasks
+    }
+
+    /// Takes a download job, splits it into tasks, and sends them to connected servers.
+    pub async fn distribute_and_dispatch(
+        &self,
+        job_id: String,
+        url: String,
+        file_size: u64,
+    ) -> Result<()> {
+        let servers = self.connections.get_all_servers();
+        let num_servers = servers.len();
+
+        if num_servers == 0 {
+            warn!("No servers available to dispatch tasks for job {}.", job_id);
+            return Err(anyhow!("No servers available for download."));
         }
 
-        let base_interval = length / number_of_parts as u64;
-        let remainder = length % number_of_parts as u64;
+        let tasks = Self::generate_tasks(file_size);
+        info!(
+            "Distributing job {} ({} bytes) into {} tasks among {} servers.",
+            job_id, file_size, tasks.len(), num_servers
+        );
+        
+        // Distribute tasks to servers in a round-robin fashion.
+        for (i, (range_start, range_end)) in tasks.iter().enumerate() {
+            let (server_id, connection) = &servers[i % num_servers];
+            
+            let task_id = Uuid::new_v4().to_string();
+            let task = DownloadTask {
+                job_id: job_id.clone(),
+                task_id: task_id.clone(),
+                url: url.clone(),
+                range_start: *range_start,
+                range_end: *range_end,
+            };
 
-        // Create size list with base intervals
-        let mut size_list = vec![base_interval; number_of_parts];
+            let command = ManagerCommand {
+                payload: Some(ManagerPayload::AssignTask(task)),
+            };
+            
+            info!("Assigning task {} ({}..{}) to server {}", task_id, range_start, range_end, server_id);
 
-        // Distribute remainder among the parts
-        for i in 0..remainder as usize {
-            size_list[i] += 1;
-        }
-
-        // Calculate cumulative sizes
-        for i in 1..number_of_parts {
-            size_list[i] += size_list[i - 1];
-        }
-
-        // Create interval list
-        let mut interval_list = vec![[0u64; 2]; number_of_parts];
-
-        for i in 0..number_of_parts {
-            if i == 0 {
-                interval_list[i][0] = left_point;
-                interval_list[i][1] = size_list[0] - 1 + left_point;
-            } else {
-                interval_list[i][0] = size_list[i - 1] + left_point;
-                interval_list[i][1] = size_list[i] - 1 + left_point;
+            // Send the command to the server through its channel.
+            if let Err(e) = connection.sender.send(Ok(command)).await {
+                error!("Failed to send task to server {}: {}. The server might have disconnected.", server_id, e);
+                // In a real-world scenario, you might want to re-queue this task.
             }
         }
 
-        interval_list
+        Ok(())
     }
 }

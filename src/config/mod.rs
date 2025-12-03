@@ -1,4 +1,4 @@
-//! Configuration management module
+//! 配置管理模块
 
 pub mod manager;
 pub mod server;

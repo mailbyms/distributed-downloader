@@ -1,27 +1,27 @@
-//! Distributed Downloader - A high-performance distributed file downloader
+//! 分布式下载器 - 一个高性能的分布式文件下载器
 //!
-//! This crate provides the core functionality for a distributed file downloading system
-//! with manager, server, and client components.
+//! 这个crate提供了分布式文件下载系统的核心功能
+//! 包含管理器、服务器和客户端组件。
 
-/// Configuration module for all components
+/// 所有组件的配置模块
 pub mod config;
 
-/// Network communication module
+/// 网络通信模块
 pub mod network;
 
-/// Download functionality
+/// 下载功能
 pub mod downloader;
 
-/// Utility functions and helpers
+/// 实用函数和辅助工具
 pub mod utils;
 
-/// Error types and handling
+/// 错误类型和处理
 pub mod error;
 
-/// Protobuf generated messages
+/// Protobuf生成的消息
 pub mod proto;
 
-// Re-export commonly used types
+// 重新导出常用的类型
 pub use config::{ClientConfig, ServerConfig, ManagerConfig};
 pub use downloader::HttpDownloader;
 pub use error::DistributedDownloaderError;

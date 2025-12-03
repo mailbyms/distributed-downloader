@@ -1,4 +1,4 @@
-//! Unit tests for configuration modules
+//! 配置模块的单元测试
 
 #[cfg(test)]
 mod tests {
@@ -16,10 +16,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("manager.yml");
 
-        // Test saving config
+        // 测试保存配置
         assert!(config.to_file(config_path.to_str().unwrap()).is_ok());
 
-        // Test loading config
+        // 测试加载配置
         let loaded_config = ManagerConfig::from_file(config_path.to_str().unwrap()).unwrap();
         assert_eq!(config.manager_addr_ipv4, loaded_config.manager_addr_ipv4);
         assert_eq!(config.manager_port, loaded_config.manager_port);
@@ -39,10 +39,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("server.yml");
 
-        // Test saving config
+        // 测试保存配置
         assert!(config.to_file(config_path.to_str().unwrap()).is_ok());
 
-        // Test loading config
+        // 测试加载配置
         let loaded_config = ServerConfig::from_file(config_path.to_str().unwrap()).unwrap();
         assert_eq!(config.to_client_port, loaded_config.to_client_port);
         assert_eq!(config.threads_num, loaded_config.threads_num);
@@ -64,10 +64,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("client.yml");
 
-        // Test saving config
+        // 测试保存配置
         assert!(config.to_file(config_path.to_str().unwrap()).is_ok());
 
-        // Test loading config
+        // 测试加载配置
         let loaded_config = ClientConfig::from_file(config_path.to_str().unwrap()).unwrap();
         assert_eq!(config.client_addr_ipv4, loaded_config.client_addr_ipv4);
         assert_eq!(config.to_server_port, loaded_config.to_server_port);
