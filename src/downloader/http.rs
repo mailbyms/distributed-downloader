@@ -2,6 +2,8 @@
 
 use crate::error::Result;
 use bytes::Bytes;
+use futures_util::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 
 /// A new, standalone function to download a specific byte range from a URL into memory.
@@ -25,7 +27,7 @@ impl HttpDownloader {
         Self { client }
     }
 
-    /// Downloads a segment using a range request into a Bytes buffer.
+    /// Downloads a segment using a range request into a Bytes buffer, with a progress bar.
     pub async fn partial_request(&self, url: &str, left_point: u64, right_point: u64) -> Result<Bytes> {
         let range_header = format!("bytes={}-{}", left_point, right_point);
 
@@ -36,7 +38,6 @@ impl HttpDownloader {
             .send()
             .await?;
         
-        // Ensure the request was successful
         let status = response.status();
         if !status.is_success() {
             return Err(crate::error::DistributedDownloaderError::HttpError(
@@ -44,8 +45,26 @@ impl HttpDownloader {
             ));
         }
 
-        let body = response.bytes().await?;
-        Ok(body)
+        let total_size = right_point.saturating_sub(left_point) + 1;
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        let mut stream = response.bytes_stream();
+        let mut downloaded_data = Vec::with_capacity(total_size as usize);
+
+        while let Some(item) = stream.next().await {
+            let chunk = item?;
+            downloaded_data.extend_from_slice(&chunk);
+            pb.inc(chunk.len() as u64);
+        }
+
+        pb.finish_with_message("Chunk download complete");
+        Ok(Bytes::from(downloaded_data))
     }
 }
 

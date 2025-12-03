@@ -101,7 +101,8 @@ impl GrpcManagerService for ManagerServiceImpl {
 
         let server_manager = self.servers.clone();
         let job_manager = self.jobs.clone();
-        let server_id = Arc::new(Mutex::new(None::<String>));
+        let task_queue = self.task_queue.clone();
+        let server_id_arc = Arc::new(Mutex::new(None::<String>));
 
         tokio::spawn(async move {
             // 1. Handle Registration
@@ -113,21 +114,22 @@ impl GrpcManagerService for ManagerServiceImpl {
                         sender: out_tx,
                         status: Mutex::new(ServerStatus::Idle),
                     });
-                    *server_id.lock().await = Some(id.clone());
+                    *server_id_arc.lock().await = Some(id.clone());
                     server_manager.servers.insert(id, server_conn);
-                } else { /* ... error handling ... */ return; }
-            } else { /* ... error handling ... */ return; }
+                } else { return; }
+            } else { return; }
 
             // 2. Process subsequent messages
-            let current_server_id_arc = server_id.clone();
             while let Some(result) = in_stream.next().await {
                 if let Ok(msg) = result {
                     if let Some(payload) = msg.payload {
-                        let mut job_to_remove = None; // To remove job outside of lock
+                        
+                        let mut job_to_remove = None;
 
                         match payload {
                             ServerPayload::ChunkData(chunk) => {
                                 let mut job_is_complete = false;
+                                // Find the job and client associated with this chunk
                                 if let Some(job_entry) = job_manager.jobs.get(&chunk.job_id) {
                                     let mut job = job_entry.lock().await;
                                     let client_chunk = ClientDataChunk {
@@ -137,10 +139,10 @@ impl GrpcManagerService for ManagerServiceImpl {
                                             data: chunk.data,
                                         })),
                                     };
-                                    
+                                    // Forward chunk to client
                                     if job.sender.send(Ok(client_chunk)).await.is_err() {
                                         warn!("[Job: {}] Client disconnected. Flagging job for removal.", chunk.job_id);
-                                        job_is_complete = true; // Use the same flag to trigger removal
+                                        job_is_complete = true;
                                     } else {
                                         job.completed_chunks += 1;
                                         if job.completed_chunks >= job.total_chunks {
@@ -152,42 +154,41 @@ impl GrpcManagerService for ManagerServiceImpl {
                                 }
 
                                 if job_is_complete {
-                                    info!("[Job: {}] Job is complete or cancelled. Flagging for removal.", chunk.job_id);
                                     job_to_remove = Some(chunk.job_id.clone());
-                                }
-
-                                // Set server status back to Idle
-                                if let Some(id_str) = current_server_id_arc.lock().await.as_ref() {
-                                    if let Some(server_conn) = server_manager.servers.get(id_str) {
-                                        *server_conn.status.lock().await = ServerStatus::Idle;
-                                        info!("[Server: {}] Status set to Idle after ChunkData.", id_str);
-                                    }
                                 }
                             }
                             ServerPayload::TaskResult(res) => {
-                                info!("[Task: {}] Server reports task finished. Success: {}", res.task_id, res.success);
-                                // Set server status back to Idle
-                                if let Some(id_str) = current_server_id_arc.lock().await.as_ref() {
-                                    if let Some(server_conn) = server_manager.servers.get(id_str) {
-                                        *server_conn.status.lock().await = ServerStatus::Idle;
-                                        info!("[Server: {}] Status set to Idle after TaskResult.", id_str);
+                                if !res.success {
+                                    if let Some(task) = res.task {
+                                        warn!("[Manager] Re-queueing failed task {}.", task.task_id);
+                                        task_queue.lock().await.push_front(task);
                                     }
                                 }
                             }
-                             _ => {}
+                            _ => {}
                         }
 
-                        // Perform removal outside of any locks
+                        // Set server status back to Idle after it has reported in
+                        if let Some(id_str) = server_id_arc.lock().await.as_ref() {
+                            if let Some(server_conn) = server_manager.servers.get(id_str) {
+                                *server_conn.status.lock().await = ServerStatus::Idle;
+                                info!("[Server: {}] Status set to Idle.", id_str);
+                            }
+                        }
+
+                        // Perform job removal outside of any other locks
                         if let Some(id) = job_to_remove {
-                            job_manager.jobs.remove(&id);
-                            info!("[Job: {}] Removed from active jobs.", id);
+                             if let Some((_, job)) = job_manager.jobs.remove(&id) {
+                                info!("[Job: {}] All chunks complete or client disconnected. Closing stream.", id);
+                                drop(job); // This drops the sender, closing the stream
+                             }
                         }
                     }
                 }
             }
 
-            // 3. Cleanup on disconnect
-            if let Some(id) = &*server_id.lock().await {
+            // 3. Cleanup on server disconnect
+            if let Some(id) = &*server_id_arc.lock().await {
                 info!("[Server: {}] Disconnected.", id);
                 server_manager.servers.remove(id);
             }
@@ -216,11 +217,7 @@ impl GrpcManagerService for ManagerServiceImpl {
             // 1. Get file metadata
             let response = match http_client.get(&url).send().await {
                 Ok(res) => res,
-                Err(e) => {
-                     /* ... error handling ... 打印错误信息*/
-                    warn!("[Job: {}] Failed to fetch URL: {}. Error: {}", job_id, url, e); 
-                     return; 
-                    }
+                Err(_) => { /* ... error handling ... */ return; }
             };
             let final_url = response.url().clone();
             let file_size = match response.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()) {
@@ -231,21 +228,23 @@ impl GrpcManagerService for ManagerServiceImpl {
 
             // 2. Generate task chunks
             let mut tasks = VecDeque::new();
-            let mut current_pos = 0;
-            while current_pos < file_size {
-                let end_pos = (current_pos + MAX_CHUNK_SIZE - 1).min(file_size - 1);
-                tasks.push_back(DownloadTask {
-                    job_id: job_id.clone(),
-                    task_id: Uuid::new_v4().to_string(),
-                    url: final_url.to_string(),
-                    range_start: current_pos,
-                    range_end: end_pos,
-                });
-                current_pos = end_pos + 1;
+            if file_size > 0 {
+                let mut current_pos = 0;
+                while current_pos < file_size {
+                    let end_pos = (current_pos + MAX_CHUNK_SIZE - 1).min(file_size - 1);
+                    tasks.push_back(DownloadTask {
+                        job_id: job_id.clone(),
+                        task_id: Uuid::new_v4().to_string(),
+                        url: final_url.to_string(),
+                        range_start: current_pos,
+                        range_end: end_pos,
+                    });
+                    current_pos = end_pos + 1;
+                }
             }
 
             // 3. Register the job and enqueue tasks
-            let total_chunks = if file_size == 0 { 0 } else { tasks.len() as u64 };
+            let total_chunks = tasks.len() as u64;
             let job_state = JobState {
                 sender: client_tx.clone(),
                 total_chunks,
@@ -259,6 +258,7 @@ impl GrpcManagerService for ManagerServiceImpl {
             if client_tx.send(Ok(ClientDataChunk { payload: Some(client_data_chunk::Payload::Metadata(metadata)) })).await.is_err() {
                 warn!("[Job: {}] Client disconnected before receiving metadata. Cleaning up.", job_id);
                 job_manager.jobs.remove(&job_id);
+                return;
             }
             
             // Handle zero-size files

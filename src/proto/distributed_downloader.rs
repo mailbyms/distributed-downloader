@@ -92,13 +92,11 @@ pub struct ChunkData {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TaskResult {
-    #[prost(string, tag = "1")]
-    pub job_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub task_id: ::prost::alloc::string::String,
-    #[prost(bool, tag = "3")]
+    #[prost(message, optional, tag = "1")]
+    pub task: ::core::option::Option<DownloadTask>,
+    #[prost(bool, tag = "2")]
     pub success: bool,
-    #[prost(string, tag = "4")]
+    #[prost(string, tag = "3")]
     pub error_message: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]

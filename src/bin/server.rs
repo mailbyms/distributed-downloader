@@ -105,27 +105,25 @@ async fn handle_manager_command(command: ManagerCommand, tx: ServerMessageSender
     if let Some(ManagerPayload::AssignTask(task)) = command.payload {
         info!("Received download task: {}", task.task_id);
         tokio::spawn(async move {
-            let job_id = task.job_id.clone();
-            let task_id = task.task_id.clone();
+            let task_for_result = task.clone(); // Clone for potential failure report
             let offset = task.range_start;
 
             let download_result = download_range(&task.url, task.range_start, task.range_end).await;
 
             let response_payload = match download_result {
                 Ok(data) => {
-                    info!("Task {} downloaded {} bytes successfully.", task_id, data.len());
+                    info!("Task {} downloaded {} bytes successfully.", task.task_id, data.len());
                     ServerPayload::ChunkData(ChunkData {
-                        job_id,
-                        task_id,
+                        job_id: task.job_id,
+                        task_id: task.task_id,
                         offset,
                         data: data.into(),
                     })
                 }
                 Err(e) => {
-                    error!("Task {} download failed: {}", task_id, e);
+                    error!("Task {} download failed: {}", task.task_id, e);
                     ServerPayload::TaskResult(TaskResult {
-                        job_id,
-                        task_id,
+                        task: Some(task_for_result),
                         success: false,
                         error_message: e.to_string(),
                     })

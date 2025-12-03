@@ -69,10 +69,9 @@ message ChunkData {
 
 // Sent from Server to Manager to report a task's final status.
 message TaskResult {
-    string job_id = 1;
-    string task_id = 2;
-    bool success = 3;
-    string error_message = 4;
+    DownloadTask task = 1;
+    bool success = 2;
+    string error_message = 3;
 }
 
 
