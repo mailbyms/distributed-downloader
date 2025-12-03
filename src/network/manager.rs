@@ -1,83 +1,81 @@
-//! Implements the gRPC ManagerService for the Distributed Downloader.
+//! Implements the gRPC ManagerService and the core state management logic.
 
 use anyhow::Result;
 use dashmap::DashMap;
 use futures_util::Stream;
-use std::{pin::Pin, sync::Arc};
+use std::{collections::VecDeque, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::{
-    proto::distributed_downloader::{
-        client_data_chunk, manager_service_server::ManagerService as GrpcManagerService,
-        server_message::Payload as ServerPayload, ClientDataChunk, DataChunk, DownloadRequest,
-        FileMetadata, ManagerCommand, ServerMessage,
-    },
-    utils::distributor::Distributor,
+use crate::proto::distributed_downloader::{
+    client_data_chunk, manager_service_server::ManagerService as GrpcManagerService,
+    server_message::Payload as ServerPayload, ClientDataChunk, DataChunk, DownloadRequest,
+    DownloadTask, FileMetadata, ManagerCommand, ServerMessage,
 };
 
-// Type alias for the sender part of the channel to a server.
-type ServerCommandSender = mpsc::Sender<Result<ManagerCommand, Status>>;
-// Type alias for the sender part of the channel to a client.
-type ClientDataSender = mpsc::Sender<Result<ClientDataChunk, Status>>;
+const MAX_CHUNK_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
 
-/// Holds the command-sending channel for a connected server.
+// ============== Type Definitions for State Management ==============
+
+type ServerCommandSender = mpsc::Sender<Result<ManagerCommand, Status>>;
+type ClientDataSender = mpsc::Sender<Result<ClientDataChunk, Status>>;
+pub type TaskQueue = Arc<Mutex<VecDeque<DownloadTask>>>;
+
+// ============== State Management Structs ==============
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerStatus {
+    Idle,
+    Busy(String), // Holds the task_id
+}
+
+/// Holds the state for a connected server.
 #[derive(Debug)]
 pub struct ServerConnection {
     pub sender: ServerCommandSender,
+    pub status: Mutex<ServerStatus>,
 }
 
-/// Holds the data-sending channel for a connected client.
+/// Holds the state for an active download job.
 #[derive(Debug)]
-pub struct ClientConnection {
+pub struct JobState {
     pub sender: ClientDataSender,
+    pub total_chunks: u64,
+    pub completed_chunks: u64,
 }
 
-/// Manages server connections.
+/// Manages all connected servers using a thread-safe DashMap.
 #[derive(Debug, Clone, Default)]
-pub struct ConnectionManager {
-    servers: Arc<DashMap<String, ServerConnection>>,
+pub struct ServerManager {
+    pub servers: Arc<DashMap<String, Arc<ServerConnection>>>,
 }
 
-impl ConnectionManager {
-    pub fn add_server(&self, server_id: String, sender: ServerCommandSender) {
-        self.servers
-            .insert(server_id, ServerConnection { sender });
-    }
-    pub fn remove_server(&self, server_id: &str) {
-        self.servers.remove(server_id);
-    }
-    pub fn get_all_servers(&self) -> Vec<(String, ServerConnection)> {
-        self.servers
-            .iter()
-            .map(|entry| {
-                (
-                    entry.key().clone(),
-                    ServerConnection {
-                        sender: entry.value().sender.clone(),
-                    },
-                )
-            })
-            .collect()
-    }
+/// Manages all active jobs and their clients.
+#[derive(Debug, Clone, Default)]
+pub struct JobManager {
+    pub jobs: Arc<DashMap<String, Mutex<JobState>>>,
 }
+
+// ============== gRPC Service Implementation ==============
 
 /// The main struct for our gRPC Manager service.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ManagerServiceImpl {
-    servers: ConnectionManager,
-    clients: Arc<DashMap<String, ClientConnection>>, // Key: job_id
+    pub servers: ServerManager,
+    pub jobs: JobManager,
+    pub task_queue: TaskQueue,
     http_client: reqwest::Client,
 }
 
 impl ManagerServiceImpl {
     pub fn new() -> Self {
         Self {
-            servers: ConnectionManager::default(),
-            clients: Arc::new(DashMap::new()),
+            servers: ServerManager::default(),
+            jobs: JobManager::default(),
+            task_queue: Arc::new(Mutex::new(VecDeque::new())),
             http_client: reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
                 .build()
@@ -86,7 +84,6 @@ impl ManagerServiceImpl {
     }
 }
 
-// Implement the gRPC service trait for our ManagerServiceImpl.
 #[tonic::async_trait]
 impl GrpcManagerService for ManagerServiceImpl {
     type EstablishConnectionStream =
@@ -100,77 +97,103 @@ impl GrpcManagerService for ManagerServiceImpl {
         request: Request<Streaming<ServerMessage>>,
     ) -> Result<Response<Self::EstablishConnectionStream>, Status> {
         let mut in_stream = request.into_inner();
-        let (out_tx, out_rx) = mpsc::channel(128); // Channel for sending commands to the server.
+        let (out_tx, out_rx) = mpsc::channel(128);
 
-        let server_connections = self.servers.clone();
-        let client_connections = self.clients.clone();
-        let server_id = Arc::new(Mutex::new(None));
+        let server_manager = self.servers.clone();
+        let job_manager = self.jobs.clone();
+        let server_id = Arc::new(Mutex::new(None::<String>));
 
         tokio::spawn(async move {
             // 1. Handle Registration
             if let Some(Ok(first_msg)) = in_stream.next().await {
                 if let Some(ServerPayload::Register(reg)) = first_msg.payload {
                     let id = reg.server_id;
-                    info!("Server registered with ID: {}", id);
+                    info!("[Server: {}] Registered.", id);
+                    let server_conn = Arc::new(ServerConnection {
+                        sender: out_tx,
+                        status: Mutex::new(ServerStatus::Idle),
+                    });
                     *server_id.lock().await = Some(id.clone());
-                    server_connections.add_server(id, out_tx);
-                } else {
-                    error!("First message was not registration. Closing.");
-                    return;
-                }
-            } else {
-                error!("Server disconnected before registering. Closing.");
-                return;
-            }
+                    server_manager.servers.insert(id, server_conn);
+                } else { /* ... error handling ... */ return; }
+            } else { /* ... error handling ... */ return; }
 
             // 2. Process subsequent messages
+            let current_server_id_arc = server_id.clone();
             while let Some(result) = in_stream.next().await {
-                match result {
-                    Ok(msg) => {
-                        if let Some(payload) = msg.payload {
-                            match payload {
-                                ServerPayload::ChunkData(chunk) => {
-                                    // Forward chunk data to the correct client
-                                    if let Some(client) = client_connections.get(&chunk.job_id) {
-                                        let client_chunk = ClientDataChunk {
-                                            payload: Some(client_data_chunk::Payload::Chunk(DataChunk {
-                                                job_id: chunk.job_id,
-                                                offset: chunk.offset,
-                                                data: chunk.data,
-                                            })),
-                                        };
-                                        if client.sender.send(Ok(client_chunk)).await.is_err() {
-                                            warn!("Client for job {} disconnected. Cannot forward chunk.", chunk.task_id);
-                                        }
+                if let Ok(msg) = result {
+                    if let Some(payload) = msg.payload {
+                        let mut job_to_remove = None; // To remove job outside of lock
+
+                        match payload {
+                            ServerPayload::ChunkData(chunk) => {
+                                let mut job_is_complete = false;
+                                if let Some(job_entry) = job_manager.jobs.get(&chunk.job_id) {
+                                    let mut job = job_entry.lock().await;
+                                    let client_chunk = ClientDataChunk {
+                                        payload: Some(client_data_chunk::Payload::Chunk(DataChunk {
+                                            job_id: chunk.job_id.clone(),
+                                            offset: chunk.offset,
+                                            data: chunk.data,
+                                        })),
+                                    };
+                                    
+                                    if job.sender.send(Ok(client_chunk)).await.is_err() {
+                                        warn!("[Job: {}] Client disconnected. Flagging job for removal.", chunk.job_id);
+                                        job_is_complete = true; // Use the same flag to trigger removal
                                     } else {
-                                        warn!("Received chunk for unknown job_id: {}. Discarding.", chunk.job_id);
+                                        job.completed_chunks += 1;
+                                        if job.completed_chunks >= job.total_chunks {
+                                            job_is_complete = true;
+                                        }
+                                    }
+                                } else {
+                                    warn!("[Job: {}] Received chunk for a cancelled or unknown job. Discarding.", chunk.job_id);
+                                }
+
+                                if job_is_complete {
+                                    info!("[Job: {}] Job is complete or cancelled. Flagging for removal.", chunk.job_id);
+                                    job_to_remove = Some(chunk.job_id.clone());
+                                }
+
+                                // Set server status back to Idle
+                                if let Some(id_str) = current_server_id_arc.lock().await.as_ref() {
+                                    if let Some(server_conn) = server_manager.servers.get(id_str) {
+                                        *server_conn.status.lock().await = ServerStatus::Idle;
+                                        info!("[Server: {}] Status set to Idle after ChunkData.", id_str);
                                     }
                                 }
-                                ServerPayload::TaskResult(res) => {
-                                    info!("Server reports task '{}' finished. Success: {}", res.task_id, res.success);
-                                }
-                                ServerPayload::Register(_) => {
-                                    warn!("Duplicate registration message. Ignoring.");
+                            }
+                            ServerPayload::TaskResult(res) => {
+                                info!("[Task: {}] Server reports task finished. Success: {}", res.task_id, res.success);
+                                // Set server status back to Idle
+                                if let Some(id_str) = current_server_id_arc.lock().await.as_ref() {
+                                    if let Some(server_conn) = server_manager.servers.get(id_str) {
+                                        *server_conn.status.lock().await = ServerStatus::Idle;
+                                        info!("[Server: {}] Status set to Idle after TaskResult.", id_str);
+                                    }
                                 }
                             }
+                             _ => {}
                         }
-                    }
-                    Err(status) => {
-                        error!("Error from server stream: {}. Closing.", status);
-                        break;
+
+                        // Perform removal outside of any locks
+                        if let Some(id) = job_to_remove {
+                            job_manager.jobs.remove(&id);
+                            info!("[Job: {}] Removed from active jobs.", id);
+                        }
                     }
                 }
             }
 
             // 3. Cleanup on disconnect
             if let Some(id) = &*server_id.lock().await {
-                info!("Server {} disconnected.", id);
-                server_connections.remove_server(id);
+                info!("[Server: {}] Disconnected.", id);
+                server_manager.servers.remove(id);
             }
         });
 
-        let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
-        Ok(Response::new(Box::pin(out_stream)))
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))))
     }
 
     /// Called by a client to request a new file download.
@@ -180,75 +203,71 @@ impl GrpcManagerService for ManagerServiceImpl {
     ) -> Result<Response<Self::RequestDownloadStream>, Status> {
         let req = request.into_inner();
         let job_id = Uuid::new_v4().to_string();
-        info!("({}) Received download request for URL: {}", job_id, req.url);
+        info!("[Job: {}] Received download request for URL: {}", job_id, req.url);
 
         let (client_tx, client_rx) = mpsc::channel(128);
-
-        // Store the sender so we can forward data to this client
-        self.clients
-            .insert(job_id.clone(), ClientConnection { sender: client_tx.clone() });
-
+        
         let http_client = self.http_client.clone();
-        let server_connections = self.servers.clone();
-        let clients = self.clients.clone();
+        let job_manager = self.jobs.clone();
+        let task_queue = self.task_queue.clone();
         let url = req.url;
 
-        // Spawn a master task for this download job
         tokio::spawn(async move {
-            let file_size: u64;
-            
             // 1. Get file metadata
-            match http_client.get(&url).send().await {
-                Ok(res) => {
-                    let final_url = res.url().clone();
-                    file_size = match res
-                        .headers()
-                        .get(reqwest::header::CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse().ok())
-                    {
-                        Some(size) => size,
-                        None => {
-                            let _ = client_tx.send(Err(Status::internal("Could not get content length."))).await;
-                            clients.remove(&job_id);
-                            return;
-                        }
-                    };
-                    info!("({}) Final URL: {}. Size: {}", job_id, final_url, file_size);
-                    
-                    // 2. Send metadata to client
-                    let metadata = FileMetadata { job_id: job_id.clone(), file_size };
-                    if client_tx.send(Ok(ClientDataChunk { payload: Some(client_data_chunk::Payload::Metadata(metadata)) })).await.is_err() {
-                        warn!("({}) Client disconnected before receiving metadata.", job_id);
-                        clients.remove(&job_id);
-                        return;
-                    }
-
-                    // 3. Distribute download tasks
-                    let distributor = Distributor::new(server_connections);
-                    if let Err(e) = distributor.distribute_and_dispatch(job_id.clone(), final_url.to_string(), file_size).await {
-                        error!("({}) Failed to dispatch tasks: {}", job_id, e);
-                        let _ = client_tx.send(Err(Status::internal("Failed to dispatch tasks."))).await;
-                        clients.remove(&job_id);
-                        return;
-                    }
-                }
+            let response = match http_client.get(&url).send().await {
+                Ok(res) => res,
                 Err(e) => {
-                    error!("({}) Failed to get file info: {}", job_id, e);
-                    let _ = client_tx.send(Err(Status::internal(format!("Failed to get file info: {}", e)))).await;
-                    clients.remove(&job_id);
-                    return;
-                }
+                     /* ... error handling ... 打印错误信息*/
+                    warn!("[Job: {}] Failed to fetch URL: {}. Error: {}", job_id, url, e); 
+                     return; 
+                    }
+            };
+            let final_url = response.url().clone();
+            let file_size = match response.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()) {
+                Some(size) => size,
+                None => { /* ... error handling ... */ return; }
+            };
+            info!("[Job: {}] Final URL: {}. Size: {}", job_id, final_url, file_size);
+
+            // 2. Generate task chunks
+            let mut tasks = VecDeque::new();
+            let mut current_pos = 0;
+            while current_pos < file_size {
+                let end_pos = (current_pos + MAX_CHUNK_SIZE - 1).min(file_size - 1);
+                tasks.push_back(DownloadTask {
+                    job_id: job_id.clone(),
+                    task_id: Uuid::new_v4().to_string(),
+                    url: final_url.to_string(),
+                    range_start: current_pos,
+                    range_end: end_pos,
+                });
+                current_pos = end_pos + 1;
+            }
+
+            // 3. Register the job and enqueue tasks
+            let total_chunks = if file_size == 0 { 0 } else { tasks.len() as u64 };
+            let job_state = JobState {
+                sender: client_tx.clone(),
+                total_chunks,
+                completed_chunks: 0,
+            };
+            job_manager.jobs.insert(job_id.clone(), Mutex::new(job_state));
+            task_queue.lock().await.append(&mut tasks);
+            
+            // 4. Send metadata to client
+            let metadata = FileMetadata { job_id: job_id.clone(), file_size };
+            if client_tx.send(Ok(ClientDataChunk { payload: Some(client_data_chunk::Payload::Metadata(metadata)) })).await.is_err() {
+                warn!("[Job: {}] Client disconnected before receiving metadata. Cleaning up.", job_id);
+                job_manager.jobs.remove(&job_id);
             }
             
-            // The spawned task for this job ends here.
-            // The forwarding of chunks will happen in the `establish_connection` method.
-            // A separate task could monitor the overall job progress and close the client stream,
-            // or remove the client connection from the map when all chunks are received.
-            // For now, we leave the stream open.
+            // Handle zero-size files
+            if file_size == 0 {
+                info!("[Job: {}] Zero-size file. Closing client stream.", job_id);
+                job_manager.jobs.remove(&job_id);
+            }
         });
 
-        let out_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
-        Ok(Response::new(Box::pin(out_stream)))
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(client_rx))))
     }
 }
