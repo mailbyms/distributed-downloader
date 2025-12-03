@@ -2,8 +2,6 @@
 
 一个用 Rust 编写的高性能、基于 gRPC 的分布式文件下载器。该项目通过将下载任务动态分发到多个工作节点来加速大文件的下载过程。
 
-![Logo](ReadmeFig/logo.png)
-
 ## 特性
 
 - **分布式架构**：采用 Manager-Server-Client 架构，通过 gRPC 实现高效、健壮的通信。
@@ -39,8 +37,6 @@
     *   持续接收 Manager 转发来的数据块，并根据偏移量写入文件的正确位置，直到下载完成，并实时显示进度。
 
 ### 系统工作流程
-
-![System Workflow](ReadmeFig/sys.png)
 
 ```mermaid
 sequenceDiagram
@@ -83,6 +79,7 @@ cargo build --release
 ```
 
 ## 使用方法
+运行 `ddr -h` 查看参数
 
 ### 1. 启动管理器 (Manager)
 
@@ -122,9 +119,9 @@ Server 将连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `--man
 
 **示例下载命令**:
 ```bash
-cargo run manager -- --port 5000
-cargo run server -- --manager-address http://127.0.0.1:5000
-cargo run client -- https://httpbin.org/json -o output.json --manager-address http://127.0.0.1:5000
+cargo run manager --port 5000
+cargo run server --manager-address http://127.0.0.1:5000
+cargo run client --output output.json --manager-address http://127.0.0.1:5000 https://httpbin.org/json
 ```
 
 ## 构建和运行测试
