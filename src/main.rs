@@ -1,6 +1,7 @@
 
 use clap::{Parser, Subcommand};
 use ddr::{client, manager, server};
+use tracing::info;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -21,19 +22,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     match &cli.command {
         Commands::Client(args) => {
-            println!("Starting in client mode...");
+            info!("Starting in client mode...");
             client::run(args).await?;
         }
         Commands::Manager(args) => {
-            println!("Starting in manager mode...");
+            info!("Starting in manager mode...");
             manager::run(args).await?;
         }
         Commands::Server(args) => {
-            println!("Starting in server mode...");
+            info!("Starting in server mode...");
             server::run(args).await?;
         }
     }
