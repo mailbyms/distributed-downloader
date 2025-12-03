@@ -68,10 +68,9 @@ async fn run_scheduler(service: ManagerServiceImpl) {
         // 3. Find an idle server
         let mut idle_server = None;
         for entry in service.servers.servers.iter() {
-            let mut status = entry.value().status.lock().await;
+            let status = entry.value().status.lock().await;
             if *status == ServerStatus::Idle {
                 // Tentatively mark as busy to avoid race conditions
-                *status = ServerStatus::Busy("pending_assignment".to_string());
                 idle_server = Some((entry.key().clone(), entry.value().clone()));
                 break;
             }
@@ -90,7 +89,7 @@ async fn run_scheduler(service: ManagerServiceImpl) {
                 // Send the task
                 if server_conn.sender.send(Ok(command)).await.is_ok() {
                     // Finalize assignment by updating status with the correct task_id
-                    *server_conn.status.lock().await = ServerStatus::Busy(task.task_id);
+                    *server_conn.status.lock().await = ServerStatus::Busy(task.clone());
                 } else {
                     // Sending failed, server likely disconnected.
                     warn!("[Scheduler] Failed to send task to server {}. Removing server and re-queueing task.", server_id);

@@ -29,7 +29,7 @@ pub type TaskQueue = Arc<Mutex<VecDeque<DownloadTask>>>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerStatus {
     Idle,
-    Busy(String), // Holds the task_id
+    Busy(DownloadTask), // Holds the full task
 }
 
 /// Holds the state for a connected server.
@@ -190,7 +190,13 @@ impl GrpcManagerService for ManagerServiceImpl {
             // 3. Cleanup on server disconnect
             if let Some(id) = &*server_id_arc.lock().await {
                 info!("[Server: {}] Disconnected.", id);
-                server_manager.servers.remove(id);
+                if let Some((_server_id, server_conn)) = server_manager.servers.remove(id) {
+                    let status = server_conn.status.lock().await;
+                    if let ServerStatus::Busy(task) = &*status {
+                        warn!("[Manager] Server {} disconnected while busy with task {}. Re-queueing.", id, task.task_id);
+                        task_queue.lock().await.push_front(task.clone());
+                    }
+                }
             }
         });
 
