@@ -85,35 +85,34 @@ cargo build --release
 
 在一个终端中启动 Manager：
 ```bash
-.\target\debug\ddr manager --port 5000
+.\target\debug\ddr manager
 ```
-Manager 将监听 `0.0.0.0:5000`。您可以通过 `--port` 参数指定其他端口。
+Manager 将默认监听 `0.0.0.0:5000`。您可以通过 `--port` 参数指定其他端口。
 
 ### 2. 启动服务器 (Server)
 
 根据需要，在一个或多个终端中启动 Server 节点：
 ```bash
 # 启动第一个 Server
-.\target\debug\ddr server --manager-address http://127.0.0.1:5000
+.\target\debug\ddr server
 
 # 启动更多 Server...
-.\target\debug\ddr server --manager-address http://127.0.0.1:5000
+.\target\debug\ddr server
 ```
-Server 将连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `--manager-address` 参数指定 Manager 的地址。
+Server 将默认连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `-m` 或 `--manager-address` 参数指定 Manager 的地址。
 
 ### 3. 启动客户端 (Client) 下载
 
 在另一个终端中，使用 Client 发起下载：
 ```bash
-.\target\debug\ddr client <URL> -o <OUTPUT_FILE_PATH> --manager-address http://127.0.0.1:5000
+.\target\debug\ddr client <URL> -o <OUTPUT_FILE_PATH>
 ```
+Client 将默认连接到 `http://127.0.0.1:5000` 的 Manager。您可以通过 `-m` 或 `--manager-address` 参数指定 Manager 的地址。
 
 **示例**:
 ```bash
-.\target\debug\ddr client "https://releases.ubuntu.com/22.04.1/ubuntu-22.04.1-desktop-amd64.iso" -o "ubuntu.iso" --manager-address http://127.0.0.1:5000
+.\target\debug\ddr client "https://releases.ubuntu.com/22.04.1/ubuntu-22.04.1-desktop-amd64.iso"
 ```
-
-将 `<URL>` 替换为您要下载的文件URL，`<OUTPUT_FILE_PATH>` 替换为您希望保存的文件路径，`--manager-address` 指定 Manager 的地址。
 
 ## 调试
 

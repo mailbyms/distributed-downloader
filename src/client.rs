@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use tonic::Request;
 use tracing::{info, warn};
 use url::Url;
+use percent_encoding::{percent_decode_str};
 
 use crate::proto::distributed_downloader::{
     client_data_chunk, manager_service_client::ManagerServiceClient, DownloadRequest,
@@ -43,15 +44,16 @@ pub async fn run(args: &Args) -> Result<()> {
         let segments = parsed_url
             .path_segments()
             .ok_or_else(|| anyhow::anyhow!("Could not get path segments from URL"))?;
-        let filename_str = segments
+        let filename_str_encoded = segments
             .last()
             .ok_or_else(|| anyhow::anyhow!("Could not get last path segment from URL"))?;
+        let filename_str = percent_decode_str(filename_str_encoded).decode_utf8_lossy();
 
         if filename_str.is_empty() {
             warn!("Could not extract filename from URL, using 'downloaded_file' as default.");
             PathBuf::from("downloaded_file")
         } else {
-            PathBuf::from(filename_str)
+            PathBuf::from(filename_str.into_owned())
         }
     };
 

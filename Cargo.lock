@@ -370,6 +370,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "indicatif",
+ "percent-encoding",
  "prost",
  "prost-types",
  "reqwest",

@@ -47,6 +47,8 @@ anyhow = "1.0"
 
 # URL处理
 url = "2.5.0"
+# URL百分比编码解码
+percent-encoding = "2.3.1"
 
 # 高效字节数组
 bytes = "1"
