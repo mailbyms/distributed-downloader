@@ -1,13 +1,13 @@
 
-//! Client logic for the Distributed Downloader.
-
 use anyhow::Result;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use tonic::Request;
 use tracing::{info, warn};
+use url::Url;
 
 use crate::proto::distributed_downloader::{
     client_data_chunk, manager_service_client::ManagerServiceClient, DownloadRequest,
@@ -20,9 +20,9 @@ pub struct Args {
     #[clap()]
     pub url: String,
 
-    /// The output file name.
+    /// The output file name. If not provided, the filename will be extracted from the URL.
     #[clap(short, long)]
-    pub output: String,
+    pub output: Option<String>,
 
     /// Address of the manager (e.g., "http://127.0.0.1:5000").
     #[clap(short, long, default_value = "http://127.0.0.1:5000")]
@@ -36,9 +36,28 @@ pub async fn run(args: &Args) -> Result<()> {
     let mut client = ManagerServiceClient::connect(args.manager_address.clone()).await?;
     info!("Successfully connected to manager.");
 
+    let output_file_name = if let Some(output) = &args.output {
+        PathBuf::from(output)
+    } else {
+        let parsed_url = Url::parse(&args.url)?;
+        let segments = parsed_url
+            .path_segments()
+            .ok_or_else(|| anyhow::anyhow!("Could not get path segments from URL"))?;
+        let filename_str = segments
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("Could not get last path segment from URL"))?;
+
+        if filename_str.is_empty() {
+            warn!("Could not extract filename from URL, using 'downloaded_file' as default.");
+            PathBuf::from("downloaded_file")
+        } else {
+            PathBuf::from(filename_str)
+        }
+    };
+
     let request = Request::new(DownloadRequest {
         url: args.url.clone(),
-        output_file: args.output.clone(),
+        output_file: output_file_name.to_string_lossy().into_owned(),
     });
 
     info!("Sending download request to manager...");
@@ -64,7 +83,7 @@ pub async fn run(args: &Args) -> Result<()> {
             let file = OpenOptions::new()
                 .write(true)
                 .create(true)
-                .open(&args.output)?;
+                .open(&output_file_name)?;
             file.set_len(metadata.file_size)?;
 
             Ok((file, pb))
@@ -91,7 +110,10 @@ pub async fn run(args: &Args) -> Result<()> {
     }
 
     pb.finish_with_message("Download complete");
-    info!("File '{}' has been downloaded successfully.", args.output);
+    info!(
+        "File '{}' has been downloaded successfully.",
+        output_file_name.to_string_lossy()
+    );
 
     Ok(())
 }

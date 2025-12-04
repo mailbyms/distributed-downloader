@@ -45,6 +45,9 @@ futures-util = "0.3"
 # 错误处理
 anyhow = "1.0"
 
+# URL处理
+url = "2.5.0"
+
 # 高效字节数组
 bytes = "1"
 
