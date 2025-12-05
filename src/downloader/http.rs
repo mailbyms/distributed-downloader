@@ -56,11 +56,34 @@ impl HttpDownloader {
 
         let mut stream = response.bytes_stream();
         let mut downloaded_data = Vec::with_capacity(total_size as usize);
+        let mut current_downloaded_size: u64 = 0;      
 
         while let Some(item) = stream.next().await {
             let chunk = item?;
+            
+            if current_downloaded_size + (chunk.len() as u64) > total_size {
+                pb.finish_with_message("Error: Received more data than expected.");
+                return Err(crate::error::DistributedDownloaderError::HttpError(
+                    format!(
+                        "Received more data than expected for range {}-{}. Expected: {} bytes, Received so far: {} bytes, Current chunk: {} bytes.",
+                        left_point, right_point, total_size, current_downloaded_size, chunk.len()
+                    )
+                ));
+            }
+
             downloaded_data.extend_from_slice(&chunk);
+            current_downloaded_size += chunk.len() as u64;
             pb.inc(chunk.len() as u64);
+        }
+
+        if current_downloaded_size != total_size {
+            pb.finish_with_message("Error: Incomplete chunk download.");
+            return Err(crate::error::DistributedDownloaderError::HttpError(
+                format!(
+                    "Did not receive the expected amount of data for range {}-{}. Expected: {} bytes, Received: {} bytes.",
+                    left_point, right_point, total_size, current_downloaded_size
+                )
+            ));
         }
 
         pb.finish_with_message("Chunk download complete");
